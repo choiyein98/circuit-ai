@@ -34,10 +34,12 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.5):
     for curr in parts:
         is_dup = False
         for k in final:
+            # 1. IoU(면적 겹침) 체크
             iou = calculate_iou(curr['box'], k['box'])
             if iou > iou_thresh:
                 is_dup = True; break
             
+            # 2. 포함 관계 체크 (큰 박스 안에 작은 박스가 80% 이상 들어가면 제거)
             x1 = max(curr['box'][0], k['box'][0])
             y1 = max(curr['box'][1], k['box'][1])
             x2 = min(curr['box'][2], k['box'][2])
@@ -48,6 +50,7 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.5):
             if curr_area > 0 and (inter_area / curr_area) > 0.8:
                 is_dup = True; break
 
+            # 3. 거리 체크
             if dist_thresh > 0:
                 dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
                 if dist < dist_thresh:
@@ -64,7 +67,7 @@ def get_center(box):
 # [3. 회로도 분석 (강제 보정 로직 최우선 적용)]
 # ==========================================
 def analyze_schematic(img, model):
-    # 1. 모든 부품 일단 다 잡기 (낮은 conf)
+    # 1. 일단 낮은 기준으로 모든 후보 검출
     res = model.predict(source=img, conf=0.01, verbose=False)
     
     raw = []
@@ -73,11 +76,13 @@ def analyze_schematic(img, model):
         raw_name = model.names[cls_id].lower()
         conf = float(b.conf[0])
         
-        # 2. 부품별 1차 필터링
-        if 'cap' in raw_name or 'source' in raw_name or 'volt' in raw_name:
-            min_conf = 0.10  # 잘 안잡히는 것들
+        # 2. [핵심] 부품별 차등 기준 적용 (Dynamic Threshold)
+        # 커패시터, 전압원 등은 잘 안 잡히므로 기준을 낮춤 (0.1)
+        if 'cap' in raw_name or 'source' in raw_name or 'volt' in raw_name or 'batt' in raw_name:
+            min_conf = 0.10  
+        # 저항은 오인식이 많으므로 기준을 높임 (0.25)
         elif 'res' in raw_name:
-            min_conf = 0.25  # 너무 잘 잡히는 저항
+            min_conf = 0.25  
         else:
             min_conf = 0.20
             
@@ -93,7 +98,7 @@ def analyze_schematic(img, model):
     # 3. 중복 제거
     clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1)
     
-    # 4. [강력 보정] 가장 왼쪽에 있는 부품 찾기 (전압원 오인식 해결)
+    # 4. [강력 보정] 가장 왼쪽에 있는 부품 찾기 (전압원 오인식 원천 차단)
     leftmost_idx = -1
     min_x = float('inf')
     
@@ -118,14 +123,12 @@ def analyze_schematic(img, model):
         elif 'volt' in raw_name or 'batt' in raw_name or 'source' in raw_name: name = 'source'
 
         # [최우선 순위] 가장 왼쪽 부품은 무조건 Source로 변경
-        # 기존 이름이 뭐든 상관없이 덮어씌움
+        # 기존 이름이 저항이든 뭐든 상관없이 덮어씌움
         if i == leftmost_idx:
             name = 'source'
         
-        # 그리기
+        # 그리기 (전원은 파란색, 나머지는 빨간색)
         x1, y1, x2, y2 = map(int, p['box'])
-        
-        # 전원은 파란색, 나머지는 빨간색으로 구분해서 시각화
         box_color = (255, 0, 0) if name == 'source' else (0, 0, 255) # BGR
         
         cv2.rectangle(img, (x1, y1), (x2, y2), box_color, 2)
@@ -136,11 +139,11 @@ def analyze_schematic(img, model):
     return img, {'total': len(clean), 'details': summary_details}
 
 # ==========================================
-# [4. 실물 분석]
+# [4. 실물 분석 (완벽함 - 노이즈 방지 유지)]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
-    # 실물 노이즈 방지 (0.30)
+    # 실물 노이즈 방지 (0.30) - 커패시터 오인식 방지
     res = model.predict(source=img, conf=0.30, verbose=False)
     
     bodies = []
@@ -222,7 +225,6 @@ def analyze_real(img, model):
 # ==========================================
 # [5. 메인 UI]
 # ==========================================
-# [확인 포인트] 제목이 V6로 바뀌어야 적용된 것입니다!
 st.title("🧠 BrainBoard V6 (전원부 강제 고정)")
 st.markdown("### 1. 부품 일치 여부 확인")
 st.markdown("### 2. 전원 연결 상태(ON/OFF) 확인")
