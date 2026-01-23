@@ -86,7 +86,7 @@ def analyze_schematic(img, model):
     return img, summary
 
 # ==========================================
-# [분석 함수 2: 실물 (Real Board) - 다리 중심 시각화]
+# [분석 함수 2: 실물 (Real Board) - 다리 점 제거 버전]
 # ==========================================
 def analyze_real(img, model):
     height, width, _ = img.shape
@@ -183,7 +183,7 @@ def analyze_real(img, model):
                         break 
                 if comp['is_active']: break
 
-    # 6. [시각화] 몸통은 얇게, 다리는 점으로!
+    # 6. [시각화] 몸통은 얇게, 다리는 선으로만 표시 (점 제거)
     summary = {'total': 0, 'on': 0, 'off': 0, 'details': {}}
     
     for comp in components:
@@ -205,16 +205,16 @@ def analyze_real(img, model):
         # 1) 몸통 박스는 얇게 표시 (식별용)
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
         
-        # 2) [핵심] 다리 위치에 '점' 찍고 연결선 그리기
+        # 2) [수정됨] 다리 위치까지 선만 그리고, 점(원)은 그리지 않음
         for leg in comp['my_legs']:
             lx, ly = map(int, leg['center'])
             
             # 몸통 중심에서 다리까지 선 그리기
             cv2.line(img, (int(center[0]), int(center[1])), (lx, ly), color, 2)
             
-            # 다리 끝부분에 원 그리기 (여기가 연결 포인트)
-            cv2.circle(img, (lx, ly), 8, color, -1) 
-            cv2.circle(img, (lx, ly), 8, (255, 255, 255), 2) # 흰 테두리
+            # 점 그리는 부분 주석 처리 (삭제)
+            # cv2.circle(img, (lx, ly), 8, color, -1) 
+            # cv2.circle(img, (lx, ly), 8, (255, 255, 255), 2) # 흰 테두리
 
         # 3) 상태 텍스트
         cv2.putText(img, status, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
@@ -225,7 +225,7 @@ def analyze_real(img, model):
     return img, summary
 
 # ==========================================
-# [Main UI Execution] - 여기가 있어야 화면이 나옵니다!
+# [Main UI Execution]
 # ==========================================
 st.title("🧠 BrainBoard V44: AI Circuit Verifier")
 st.markdown("### PSpice 회로도와 실제 브레드보드 사진을 업로드하세요.")
@@ -282,8 +282,8 @@ if ref_file and tgt_file:
             if tgt_data['off'] == 0:
                 st.success(f"🎉 Perfect! 모든 부품({tgt_data['total']}개)이 정상 연결되었습니다.")
             else:
-                st.error(f"❌ {tgt_data['off']}개의 부품이 연결되지 않았습니다. (빨간색 점 확인)")
+                st.error(f"❌ {tgt_data['off']}개의 부품이 연결되지 않았습니다. (빨간색 표시 확인)")
 
             # 3. 이미지 출력 (BGR -> RGB 변환 필수)
             st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="PSpice 회로도 분석", use_column_width=True)
-            st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption="실물 보드 분석 (점 = 다리 위치)", use_column_width=True)
+            st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption="실물 보드 분석 (선 = 다리 연결)", use_column_width=True)
