@@ -1,142 +1,212 @@
-# ==========================================
-# [분석 함수 2: 실물 (Real Board) - 다리 중심 시각화]
-# ==========================================
-def analyze_real(img, model):
-    height, width, _ = img.shape
-    
-    # 1. 모델 예측
-    results = model.predict(source=img, save=False, conf=0.15, verbose=False)
-    boxes = results[0].boxes
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import sys
+import math
+import tkinter as tk
+from tkinter import filedialog
 
-    # 2. 객체 수집
-    components = [] 
-    legs = []       
+# ==========================================
+# [설정 및 상수]
+# ==========================================
+MODEL_REAL_PATH = 'best.pt'    # 실물 보드용 모델
+MODEL_SYM_PATH = 'symbol.pt'   # 회로도용 모델
+PIN_SENSITIVITY = 140          # 핀과 부품 간 연결 감지 범위 (픽셀 단위)
+
+# ==========================================
+# [Helper Functions]
+# ==========================================
+def solve_overlap(parts, dist_thresh=60):
+    """
+    중복 감지된 객체들을 거리 기준으로 필터링 (Conf 높은 것 우선)
+    """
+    if not parts: return []
+    # conf(신뢰도)가 높은 순서대로 정렬
+    if 'conf' in parts[0]:
+        parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
-    for box in boxes:
-        cls_id = int(box.cls[0])
-        name = model.names[cls_id].lower()
-        coords = box.xyxy[0].tolist()
-        center = get_center(coords)
+    final = []
+    for curr in parts:
+        # 이미 등록된 부품들과 너무 가까우면(중복이면) 건너뜀
+        if not any(math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2) < dist_thresh for k in final):
+            final.append(curr)
+    return final
+
+# ==========================================
+# [분석 함수 1: 회로도 (Schematic)]
+# ==========================================
+def analyze_schematic(img_path, model):
+    img = cv2.imread(img_path)
+    if img is None: return None
+    
+    # 모델 추론
+    res = model.predict(source=img, conf=0.15, verbose=False)
+    
+    raw = []
+    for b in res[0].boxes:
+        raw.append({
+            'name': model.names[int(b.cls[0])].lower(), 
+            'box': b.xyxy[0].tolist(), 
+            'center': ((b.xyxy[0][0]+b.xyxy[0][2])/2, (b.xyxy[0][1]+b.xyxy[0][3])/2),
+            'conf': float(b.conf[0])
+        })
+    
+    clean = solve_overlap(raw)
+    
+    for p in clean:
+        name = p['name']
+        # 가장 왼쪽 부품을 전원(Source)으로 강제 지정 (회로도 특성상)
+        if p['center'][0] < img.shape[1] * 0.25: name = 'source'
+        elif 'cap' in name: name = 'capacitor'
+        elif 'res' in name: name = 'resistor'
         
-        # 노이즈 제거
-        if (coords[2]-coords[0]) * (coords[3]-coords[1]) < (width * height * 0.001): continue
+        x1, y1, x2, y2 = map(int, p['box'])
+        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(img, name, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    return img
 
-        if any(x in name for x in ['pin', 'leg', 'lead', 'wire']):
-            # 다리(Pin)는 별도 리스트로 저장
-            legs.append({'center': center, 'box': coords, 'type': 'pin'})
+# ==========================================
+# [분석 함수 2: 실물 (Real Board)]
+# ==========================================
+def analyze_real(img_path, model):
+    img = cv2.imread(img_path)
+    if img is None: return None, 0
+    h, w, _ = img.shape
+    
+    # 모델 추론
+    res = model.predict(source=img, conf=0.1, verbose=False)
+    
+    bodies = [] # 시각화할 부품 (몸체 + 와이어)
+    pins = []   # 연결 확인용 핀 (다리) - 화면엔 안 그림
+    
+    for b in res[0].boxes:
+        name = model.names[int(b.cls[0])].lower()
+        coords = b.xyxy[0].tolist()
+        center = ((coords[0]+coords[2])/2, (coords[1]+coords[3])/2)
+        conf = float(b.conf[0])
+        
+        # [수정된 핵심 로직] 
+        # 'wire'는 핀 리스트에서 제외하고 bodies(시각화 대상)로 분류
+        
+        # 1. 핀/다리(Leg) 처리 -> 화면에 안 그리고 좌표 계산용으로만 사용
+        if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
+            pins.append(center)
+        
+        # 2. 브레드보드 배경 제외
         elif 'breadboard' in name:
             continue
-        else:
-            # 몸통(Body)
-            components.append({
-                'name': name, 'box': coords, 'center': center, 
-                'my_legs': [], 'is_active': False
-            })
-
-    components = solve_overlap(components, distance_threshold=50)
-
-    # 3. [가상 전원 레일] (인식 범위)
-    top_rail_y = height * 0.20
-    bottom_rail_y = height * 0.80
-    
-    # 전원 영역 표시 (노란 점선 느낌)
-    cv2.rectangle(img, (0, 0), (width, int(top_rail_y)), (0, 255, 255), 1) 
-    cv2.rectangle(img, (0, int(bottom_rail_y)), (width, height), (0, 255, 255), 1) 
-    
-    # 4. [다리 할당] 몸통과 가장 가까운 다리들을 찾아서 연결
-    for comp in components:
-        bw = comp['box'][2] - comp['box'][0]
-        bh = comp['box'][3] - comp['box'][1]
-        diag = math.sqrt(bw**2 + bh**2)
-        search_radius = diag * 0.8  # 부품 크기 반경 내 검색
-
-        for leg in legs:
-            dist = math.sqrt((leg['center'][0]-comp['center'][0])**2 + (leg['center'][1]-comp['center'][1])**2)
-            if dist < search_radius:
-                comp['my_legs'].append(leg)
-        
-        # 다리가 인식 안 됐을 경우, 몸통 양 끝을 가상의 다리로 설정
-        if len(comp['my_legs']) < 2:
-            x1, y1, x2, y2 = comp['box']
-            if bw > bh: # 가로형
-                comp['my_legs'] = [{'center':(x1, (y1+y2)/2)}, {'center':(x2, (y1+y2)/2)}]
-            else: # 세로형
-                comp['my_legs'] = [{'center':((x1+x2)/2, y1)}, {'center':((x1+x2)/2, y2)}]
-
-    # 5. [전류 흐름 시뮬레이션]
-    # (A) 전원 소스 찾기 (레일에 닿은 다리)
-    active_legs = [] 
-    
-    for comp in components:
-        for leg in comp['my_legs']:
-            ly = leg['center'][1]
-            if ly < top_rail_y or ly > bottom_rail_y:
-                comp['is_active'] = True
-                active_legs.append(leg['center'])
-    
-    # (B) 전류 전파 (거리 기반)
-    CONNECTION_THRESHOLD = 90 # 연결 허용 거리 (픽셀)
-    
-    changed = True
-    while changed:
-        changed = False
-        for comp in components:
-            if comp['is_active']: 
-                # 내가 켜졌으면 내 다리들도 전원 소스가 됨
-                for leg in comp['my_legs']:
-                    if leg['center'] not in active_legs:
-                        active_legs.append(leg['center'])
-                        changed = True
-                continue
             
-            # 내가 꺼져 있으면 주변에 활성 다리가 있는지 확인
-            for my_leg in comp['my_legs']:
-                for active_pt in active_legs:
-                    dist = math.sqrt((my_leg['center'][0]-active_pt[0])**2 + (my_leg['center'][1]-active_pt[1])**2)
-                    if dist < CONNECTION_THRESHOLD:
-                        comp['is_active'] = True
-                        changed = True
-                        break 
-                if comp['is_active']: break
+        # 3. 그 외 부품 (저항, 커패시터, 그리고 WIRE 포함) -> 화면에 그림
+        else:
+            bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf})
 
-    # 6. [시각화 수정] 몸통이 아닌 "다리"에 집중해서 표시
-    summary = {'total': 0, 'on': 0, 'off': 0, 'details': {}}
+    clean_bodies = solve_overlap(bodies, 60)
     
-    for comp in components:
+    # [전원 활성화 로직]
+    # 1. 핀이 상단 전원 레일(높이의 45% 지점 위쪽)에 있는지 확인
+    power_active = any(p[1] < h * 0.45 for p in pins)
+    
+    # 2. 핀이 감지되지 않았더라도, 'wire'가 상단 전원부에 있다면 전원 ON으로 간주
+    if not power_active:
+        for b in clean_bodies:
+            if 'wire' in b['name'] and b['center'][1] < h * 0.45:
+                power_active = True
+                break
+    
+    off_count = 0
+    
+    for comp in clean_bodies:
+        cx, cy = comp['center']
         name = comp['name']
-        x1, y1, x2, y2 = map(int, comp['box'])
-        center = comp['center']
-
-        if comp['is_active']:
-            color = (0, 255, 0) # 초록 (ON)
-            status = "ON"
-            summary['on'] += 1
+        is_on = False
+        
+        # 와이어는 연결선이므로 주황색으로 표시하고 항상 활성 상태로 간주
+        if 'wire' in name:
+            color = (0, 165, 255) # 주황색 (BGR 순서: Blue=0, Green=165, Red=255)
+            status = "WIRE"
+            is_on = True # 와이어는 OFF 카운트에서 제외
         else:
-            color = (0, 0, 255) # 빨강 (OFF)
-            status = "OFF"
-            summary['off'] += 1
+            # 일반 부품 로직
+            if power_active:
+                # A. 부품 자체가 전원 레일 근처(중앙 분리대 위/아래)에 위치
+                if cy < h*0.48 or cy > h*0.52: 
+                    is_on = True
+                else:
+                    # B. 부품 근처에 핀이 있고, 그 핀이 전원 쪽에 연결되어 있는지 확인
+                    for px, py in pins:
+                        if math.sqrt((cx-px)**2 + (cy-py)**2) < PIN_SENSITIVITY:
+                            # 핀의 y좌표가 중앙 영역을 벗어나 있으면(전원 레일 쪽) ON
+                            if py < h*0.48 or py > h*0.52:
+                                is_on = True; break
             
-        summary['total'] += 1
+            if is_on:
+                color = (0, 255, 0) # 초록 (ON)
+                status = "ON"
+            else:
+                color = (0, 0, 255) # 빨강 (OFF)
+                status = "OFF"
+                off_count += 1
         
-        # 1) 몸통 박스는 얇게 표시 (부품 식별용)
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
-        
-        # 2) [핵심] 다리 위치에 '점' 찍고 연결선 그리기
-        for leg in comp['my_legs']:
-            lx, ly = map(int, leg['center'])
-            
-            # 몸통 중심에서 다리까지 선 그리기 (소속 표시)
-            cv2.line(img, (int(center[0]), int(center[1])), (lx, ly), color, 2)
-            
-            # 다리 끝부분에 원 그리기 (여기가 연결 포인트!)
-            cv2.circle(img, (lx, ly), 8, color, -1) 
-            # 원 테두리 (잘 보이게)
-            cv2.circle(img, (lx, ly), 8, (255, 255, 255), 2)
-
-        # 3) 상태 텍스트 표시
+        # 결과 그리기
+        x1, y1, x2, y2 = map(int, comp['box'])
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
         cv2.putText(img, status, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         
-        base_name = name.split('_')[0]
-        summary['details'][base_name] = summary['details'].get(base_name, 0) + 1
+    return img, off_count
 
-    return img, summary
+# ==========================================
+# [Main Execution]
+# ==========================================
+if __name__ == "__main__":
+    try:
+        # 윈도우 파일 탐색기 초기화
+        root = tk.Tk()
+        root.withdraw()
+        
+        print("--- BrainBoard V44 실행 ---")
+        
+        print("1. PSpice 회로도 이미지를 선택하세요...")
+        p1 = filedialog.askopenfilename(title="1. PSpice 회로도 선택", filetypes=[("Images", "*.jpg;*.png;*.jpeg")])
+        if not p1: 
+            print("회로도 선택이 취소되었습니다.")
+            sys.exit()
+        
+        print("2. 실물 회로(브레드보드) 이미지를 선택하세요...")
+        p2 = filedialog.askopenfilename(title="2. 실물 사진 선택", filetypes=[("Images", "*.jpg;*.png;*.jpeg")])
+        if not p2: 
+            print("실물 사진 선택이 취소되었습니다.")
+            sys.exit()
+
+        print("분석 모델을 로드하고 있습니다...")
+        m_real = YOLO(MODEL_REAL_PATH)
+        m_sym = YOLO(MODEL_SYM_PATH)
+
+        print("이미지 분석 중...")
+        res1 = analyze_schematic(p1, m_sym)
+        res2, off = analyze_real(p2, m_real)
+
+        # 결과 이미지 병합 (가로로 이어붙이기)
+        if res1 is not None and res2 is not None:
+            h1, w1 = res1.shape[:2]
+            h2, w2 = res2.shape[:2]
+            max_h = max(h1, h2)
+            
+            canvas = np.zeros((max_h, w1 + w2, 3), dtype=np.uint8)
+            canvas[:h1, :w1] = res1
+            canvas[:h2, w1:w1+w2] = res2
+
+            # 화면 크기에 맞춰 리사이징 (폭 1400px 넘으면 축소)
+            if canvas.shape[1] > 1400:
+                scale = 1400 / canvas.shape[1]
+                canvas = cv2.resize(canvas, None, fx=scale, fy=scale)
+
+            print(f"분석 완료! 발견된 비정상(OFF) 부품 수: {off}")
+            cv2.imshow("BrainBoard Verification", canvas)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+            
+    except Exception as e:
+        print(f"오류가 발생했습니다: {e}")
+        import traceback
+        traceback.print_exc()
+        input("엔터를 누르면 종료합니다...")
