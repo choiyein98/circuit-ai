@@ -8,7 +8,7 @@ from PIL import Image
 # ==========================================
 # [1. 설정 및 라이브러리]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V18 (Auto-Merge)", layout="wide")
+st.set_page_config(page_title="BrainBoard V19 (Box-in-Box Fix)", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'
 MODEL_SYM_PATH = 'symbol.pt'
@@ -17,7 +17,7 @@ MODEL_SYM_PATH = 'symbol.pt'
 LEG_EXTENSION_RANGE = 180        
 
 # ==========================================
-# [2. 유틸리티 함수: 스마트 중복 제거]
+# [2. 유틸리티 함수: 스마트 중복 제거 (핵심 수정)]
 # ==========================================
 def calculate_iou(box1, box2):
     x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
@@ -29,54 +29,55 @@ def calculate_iou(box1, box2):
 
 def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4, is_schematic=False):
     """
-    [핵심] is_schematic=True일 때:
-    회로도에서 긴 저항 기호가 끊겨서 인식될 때, 
-    같은 종류끼리 가까이 있으면 무조건 하나로 합쳐버립니다.
+    [V19 핵심] 박스 안에 박스가 있는 경우(마트료시카)를 강력하게 제거
     """
     if not parts: return []
+    # 신뢰도 높은 순 정렬
     parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
     final = []
     for curr in parts:
         is_dup = False
         for k in final:
-            # 1. 기본 계산
-            iou = calculate_iou(curr['box'], k['box'])
-            
+            # 좌표 계산
             x1 = max(curr['box'][0], k['box'][0])
             y1 = max(curr['box'][1], k['box'][1])
             x2 = min(curr['box'][2], k['box'][2])
             y2 = min(curr['box'][3], k['box'][3])
+            
             inter_area = max(0, x2-x1) * max(0, y2-y1)
             area_curr = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
             area_k = (k['box'][2]-k['box'][0]) * (k['box'][3]-k['box'][1])
+            
+            # [수정] IoM (Intersection over Minimum) 계산
+            # 두 박스 중 '작은 박스'의 면적 대비 겹치는 비율
             min_area = min(area_curr, area_k)
+            overlap_ratio = inter_area / min_area if min_area > 0 else 0
 
             # -----------------------------------------------------------
-            # [MODE A] 회로도 전용 (저항 쪼개짐 방지)
+            # [로직 1] 포함 관계 제거 (공통)
+            # 작은 박스의 80% 이상이 큰 박스랑 겹치면 -> 중복 삭제
+            # -----------------------------------------------------------
+            if overlap_ratio > 0.80:
+                is_dup = True; break
+
+            # -----------------------------------------------------------
+            # [로직 2] 회로도 전용 (끊긴 선 잇기)
             # -----------------------------------------------------------
             if is_schematic:
-                # 이름이 같고(예: resistor == resistor)
-                if curr['name'] == k['name']:
-                    # 아주 조금이라도 겹치거나 (1%)
-                    if iou > 0.01: 
-                        is_dup = True; break
-                    
-                    # 거리가 가까우면 (60px 이내) -> 하나의 부품으로 간주!
-                    dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
-                    if dist < 60:
-                        is_dup = True; break
-                
-                # 이름이 달라도 포함되어 있으면 제거
-                if min_area > 0 and (inter_area / min_area) > 0.8:
+                # 같은 부품끼리는 조금만 겹쳐도(IoU > 0) 합체 (안전하게 0.01)
+                iou = calculate_iou(curr['box'], k['box'])
+                if curr['name'] == k['name'] and iou > 0.01:
                     is_dup = True; break
+                
+                # [주의] 거리 기반 합치기는 제거했습니다. (떨어진 저항 합쳐지는 부작용 방지)
             
             # -----------------------------------------------------------
-            # [MODE B] 실물 전용 (V15의 정교한 로직 유지)
+            # [로직 3] 실물 전용 (기존 유지)
             # -----------------------------------------------------------
             else:
+                iou = calculate_iou(curr['box'], k['box'])
                 if iou > iou_thresh: is_dup = True; break
-                if min_area > 0 and (inter_area / min_area) > 0.8: is_dup = True; break
                 if dist_thresh > 0:
                     dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
                     if dist < dist_thresh: is_dup = True; break
@@ -89,10 +90,10 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석 (자동 합치기 적용)]
+# [3. 회로도 분석]
 # ==========================================
 def analyze_schematic(img, model):
-    # 회로도는 1%라도 감지되면 일단 다 가져옴 (놓침 방지)
+    # 1. 1%라도 감지되면 일단 다 가져옴 (놓침 방지)
     res = model.predict(source=img, conf=0.01, verbose=False)
     
     raw = []
@@ -108,14 +109,13 @@ def analyze_schematic(img, model):
             'conf': conf
         })
     
-    # [핵심] is_schematic=True 설정 -> 쪼개진 저항 합체!
+    # [핵심] is_schematic=True -> 박스 안의 박스 강력 제거
     clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1, is_schematic=True)
     
-    # 전원 위치 보정 (왼쪽 우선)
+    # 전원 위치 보정
     leftmost_idx = -1
     min_x = float('inf')
     
-    # 전원이 없으면 가장 왼쪽 부품을 전원으로
     has_source = any(p['name'] in ['source', 'volt', 'batt'] for p in clean)
     if not has_source and clean:
         for i, p in enumerate(clean):
@@ -165,10 +165,10 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # [V15 민감도 고정] 사용자님이 "딱 좋다"고 하신 그 설정
-        if 'cap' in name: min_conf = 0.15      # 커패시터: 잘 잡게 낮춤
-        elif 'res' in name: min_conf = 0.60    # 저항: 엄격하게 높임 (가짜 방지)
-        elif 'wire' in name: min_conf = 0.15   # 와이어: 잘 잡게 낮춤
+        # [V15 민감도 고정] 사용자님이 만족하신 설정
+        if 'cap' in name: min_conf = 0.15      # 커패시터: 잘 잡게
+        elif 'res' in name: min_conf = 0.60    # 저항: 엄격하게
+        elif 'wire' in name: min_conf = 0.15   # 와이어: 잘 잡게
         else: min_conf = 0.25
             
         if conf < min_conf: continue
@@ -180,7 +180,7 @@ def analyze_real(img, model):
         else:
             bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
-    # 실물 중복 제거 (is_schematic=False)
+    # 실물 중복 제거
     clean_bodies = solve_overlap(bodies, dist_thresh=60, iou_thresh=0.3, is_schematic=False)
     
     # [연결 로직]
@@ -260,7 +260,7 @@ def analyze_real(img, model):
 # ==========================================
 # [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V18 (Auto-Merge)")
+st.title("🧠 BrainBoard V19 (Box-in-Box Fix)")
 st.markdown("### 1. 부품 일치 여부")
 st.markdown("### 2. 연결 상태")
 
@@ -311,7 +311,7 @@ if ref_file and tgt_file:
             if c_ref != c_tgt:
                 mismatch_errors.append(f"⚠️ CAPACITOR 불일치: 회로도 {c_ref}개 vs 실물 {c_tgt}개")
             
-            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (자동 통합 적용)", use_column_width=True)
+            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (겹침 보정 적용)", use_column_width=True)
             st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 분석 (OFF: {tgt_data['off']})", use_column_width=True)
             
             if mismatch_errors:
