@@ -8,7 +8,7 @@ from PIL import Image
 # ==========================================
 # [1. 설정 및 라이브러리]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V13 (Resistor Strict / Cap Loose)", layout="wide")
+st.set_page_config(page_title="BrainBoard V14 (Strict Res / Status Board)", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'
 MODEL_SYM_PATH = 'symbol.pt'
@@ -28,9 +28,6 @@ def calculate_iou(box1, box2):
     return inter / union if union > 0 else 0
 
 def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4):
-    """
-    [토너먼트 로직] 점수(conf) 높은 박스가 겹치는 하위 박스를 제거
-    """
     if not parts: return []
     parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
@@ -38,12 +35,10 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4):
     for curr in parts:
         is_dup = False
         for k in final:
-            # 1. 면적 겹침
             iou = calculate_iou(curr['box'], k['box'])
             if iou > iou_thresh:
                 is_dup = True; break
             
-            # 2. 포함 관계 (큰 박스 안에 작은 박스)
             x1 = max(curr['box'][0], k['box'][0])
             y1 = max(curr['box'][1], k['box'][1])
             x2 = min(curr['box'][2], k['box'][2])
@@ -54,7 +49,6 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4):
             if curr_area > 0 and (inter_area / curr_area) > 0.7:
                 is_dup = True; break
 
-            # 3. 거리
             if dist_thresh > 0:
                 dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
                 if dist < dist_thresh:
@@ -68,7 +62,7 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석: 1% 탐지 + 토너먼트]
+# [3. 회로도 분석]
 # ==========================================
 def analyze_schematic(img, model):
     res = model.predict(source=img, conf=0.01, verbose=False)
@@ -88,7 +82,6 @@ def analyze_schematic(img, model):
     
     clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1)
     
-    # [강제 보정] 왼쪽 = Source
     leftmost_idx = -1
     min_x = float('inf')
     if clean:
@@ -123,7 +116,7 @@ def analyze_schematic(img, model):
     return img, {'total': len(clean), 'details': summary_details}
 
 # ==========================================
-# [4. 실물 분석: 저항은 엄격하게, 커패시터는 관대하게]
+# [4. 실물 분석: 저항 기준 60%로 상향]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
@@ -139,10 +132,10 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # [핵심 수정] 밸런스 패치
-        if 'cap' in name: min_conf = 0.10      # [DOWN] 0.15 -> 0.10 (무조건 잡아!)
-        elif 'res' in name: min_conf = 0.50    # [UP] 0.40 -> 0.50 (가짜 저항 컷!)
-        elif 'wire' in name: min_conf = 0.15   # 와이어: 관대하게
+        # [핵심 수정] 저항 기준 60%로 강화
+        if 'cap' in name: min_conf = 0.15      # 커패시터: 15% (놓치지 않게)
+        elif 'res' in name: min_conf = 0.60    # [UP] 저항: 60% (가짜 컷)
+        elif 'wire' in name: min_conf = 0.15   # 와이어: 15%
         else: min_conf = 0.25
             
         if conf < min_conf: continue
@@ -157,9 +150,7 @@ def analyze_real(img, model):
     # 중복 제거
     clean_bodies = solve_overlap(bodies, dist_thresh=50, iou_thresh=0.3)
     
-    # ----------------------------------------------------
     # [연결 로직]
-    # ----------------------------------------------------
     power_active = False
     for b in clean_bodies:
         if 'wire' in b['name'] and b['center'][1] < h * 0.45:
@@ -210,7 +201,6 @@ def analyze_real(img, model):
         norm_name = raw_name
         label_name = "" 
         
-        # [문구 표시 강화]
         if 'res' in raw_name: 
             norm_name = 'resistor'; label_name = "RES"
         elif 'cap' in raw_name: 
@@ -231,9 +221,8 @@ def analyze_real(img, model):
             status = "OFF"
             off_count += 1
         
-        # 박스 위에 "CAP: ON" 같이 표시
+        # 박스 표시
         display_text = f"{label_name}: {status}"
-        
         x1, y1, x2, y2 = map(int, comp['box'])
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
         cv2.putText(img, display_text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
@@ -243,9 +232,9 @@ def analyze_real(img, model):
 # ==========================================
 # [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V13 (Resistor Strict / Cap Loose)")
-st.markdown("### 1. 부품 일치 여부 확인")
-st.markdown("### 2. 연결 상태 (이름+상태 표시)")
+st.title("🧠 BrainBoard V14 (Strict Res / Status Board)")
+st.markdown("### 1. 부품 일치 여부")
+st.markdown("### 2. 연결 상태")
 
 @st.cache_resource
 def load_models():
@@ -276,16 +265,29 @@ if ref_file and tgt_file:
 
             st.divider()
             
-            # 불일치 검사
-            mismatch_errors = []
-            target_parts = ['resistor', 'capacitor', 'inductor'] 
+            # ------------------------------------------------
+            # [신규 기능] 부품 현황판 (Status Board)
+            # ------------------------------------------------
+            st.info("📊 **부품 인식 현황**")
             
-            for part in target_parts:
-                ref_cnt = ref_data['details'].get(part, 0)
-                tgt_cnt = tgt_data['details'].get(part, 0)
-                
-                if ref_cnt != tgt_cnt:
-                    mismatch_errors.append(f"⚠️ {part.upper()} 불일치: 회로도 {ref_cnt}개 vs 실물 {tgt_cnt}개")
+            # 저항 개수 비교
+            r_ref = ref_data['details'].get('resistor', 0)
+            r_tgt = tgt_data['details'].get('resistor', 0)
+            st.write(f"- **저항 (Resistor):** 회로도 {r_ref}개 vs 실물 {r_tgt}개")
+            
+            # 커패시터 개수 비교 (요청하신 부분!)
+            c_ref = ref_data['details'].get('capacitor', 0)
+            c_tgt = tgt_data['details'].get('capacitor', 0)
+            st.write(f"- **커패시터 (Capacitor):** 회로도 {c_ref}개 vs 실물 {c_tgt}개")
+
+            st.divider()
+
+            # 불일치 검사 (에러 메시지용)
+            mismatch_errors = []
+            if r_ref != r_tgt:
+                mismatch_errors.append(f"⚠️ RESISTOR 불일치: 회로도 {r_ref}개 vs 실물 {r_tgt}개")
+            if c_ref != c_tgt:
+                mismatch_errors.append(f"⚠️ CAPACITOR 불일치: 회로도 {c_ref}개 vs 실물 {c_tgt}개")
             
             # 이미지 출력
             st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석", use_column_width=True)
