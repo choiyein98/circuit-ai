@@ -12,56 +12,63 @@ st.set_page_config(page_title="BrainBoard V5 Final", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'      # 실물 브레드보드 분석용
 MODEL_SYM_PATH = 'symbol.pt'     # 회로도 기호 분석용
-# 연결 감지 거리 (픽셀) - 와이어와 부품이 이 거리 안에 있으면 연결된 것으로 간주
-CONNECTION_THRESHOLD = 100       
+CONNECTION_THRESHOLD = 100       # 연결 감지 거리 (픽셀)
 
 # ==========================================
-# [2. 유틸리티 함수 (NMS: 중복 제거)]
+# [2. 강력한 중복 제거 함수 (박스 안에 박스 제거)]
 # ==========================================
-def calculate_iou(box1, box2):
-    """두 박스의 겹치는 비율(IoU) 계산"""
-    x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    union = area1 + area2 - inter
-    return inter / union if union > 0 else 0
-
-def solve_overlap(parts, dist_thresh=0, iou_thresh=0.5):
+def solve_overlap(parts, overlap_thresh=0.5):
     """
-    기능: 겹치는 박스들을 정리
+    기능: 겹치거나 포함된 박스를 강력하게 제거 (NMS)
+    - overlap_thresh: 겹치는 비율이 이보다 높으면 중복으로 간주
     """
     if not parts: return []
-    if 'conf' in parts[0]:
-        parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
+    
+    # 1. 신뢰도(conf) 높은 순서대로 정렬 (중요)
+    parts.sort(key=lambda x: x['conf'], reverse=True)
     
     final = []
     for curr in parts:
         is_dup = False
-        for k in final:
-            iou = calculate_iou(curr['box'], k['box'])
-            if iou > iou_thresh:
-                is_dup = True; break
+        for kept in final:
+            # 두 박스의 교집합(Intersection) 영역 계산
+            x1 = max(curr['box'][0], kept['box'][0])
+            y1 = max(curr['box'][1], kept['box'][1])
+            x2 = min(curr['box'][2], kept['box'][2])
+            y2 = min(curr['box'][3], kept['box'][3])
             
-            if dist_thresh > 0:
-                dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
-                if dist < dist_thresh:
-                    is_dup = True; break
-                    
+            inter_w = max(0, x2 - x1)
+            inter_h = max(0, y2 - y1)
+            inter_area = inter_w * inter_h
+            
+            if inter_area > 0:
+                # 각 박스의 넓이
+                area_curr = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
+                area_kept = (kept['box'][2]-kept['box'][0]) * (kept['box'][3]-kept['box'][1])
+                
+                # [핵심 로직] "작은 박스가 큰 박스 안에 포함되었는지" 확인
+                # 교집합 영역이 작은 박스 넓이의 50% 이상을 차지하면 중복으로 간주
+                min_area = min(area_curr, area_kept)
+                overlap_ratio = inter_area / min_area
+                
+                if overlap_ratio > overlap_thresh:
+                    is_dup = True
+                    break
+        
         if not is_dup:
             final.append(curr)
+            
     return final
 
 def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석 (놓치는 부품 방지)]
+# [3. 회로도 분석 (정상화)]
 # ==========================================
 def analyze_schematic(img, model):
-    # [수정] 아주 낮은 신뢰도(0.01)로 설정하여 부품을 절대 놓치지 않게 함
-    # 대신 중복 제거(NMS)가 중요해짐
-    res = model.predict(source=img, conf=0.01, verbose=False)
+    # [수정] 신뢰도를 0.20으로 올려서 노이즈 제거 (너무 낮추면 박스가 난무함)
+    res = model.predict(source=img, conf=0.20, verbose=False)
     
     raw = []
     for b in res[0].boxes:
@@ -72,27 +79,25 @@ def analyze_schematic(img, model):
             'conf': float(b.conf[0])
         })
     
-    # 중복 제거 (IoU 0.4 기준)
-    clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.4)
+    # [수정] 강력한 중복 제거 실행 (겹침 허용치 0.1 -> 조금만 겹쳐도, 혹은 포함되면 제거)
+    clean = solve_overlap(raw, overlap_thresh=0.1)
     
     for p in clean:
         name = p['name']
+        # 위치 기반 이름 보정 (왼쪽=Source)
         if p['center'][0] < img.shape[1] * 0.25: 
             name = 'source'
         elif 'cap' in name: name = 'capacitor'
         elif 'res' in name: name = 'resistor'
         
-        # 이름 정규화 (비교를 위해)
-        p['normalized_name'] = name
-
+        # 시각화
         x1, y1, x2, y2 = map(int, p['box'])
         cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
         cv2.putText(img, name, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
         
     summary = {'total': len(clean), 'details': {}}
     for p in clean:
-        n = p['normalized_name']
-        summary['details'][n] = summary['details'].get(n, 0) + 1
+        summary['details'][p['name']] = summary['details'].get(p['name'], 0) + 1
         
     return img, summary
 
@@ -117,15 +122,10 @@ def analyze_real(img, model):
         elif 'breadboard' in name:
             continue
         else:
-            # 이름 정규화
-            norm_name = name
-            if 'cap' in name: norm_name = 'capacitor'
-            elif 'res' in name: norm_name = 'resistor'
-            elif 'wire' in name: norm_name = 'wire' # 와이어는 별도 카운트 안 함(보통)
-            
-            bodies.append({'name': name, 'normalized_name': norm_name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
+            bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
-    clean_bodies = solve_overlap(bodies, dist_thresh=60, iou_thresh=0.3)
+    # 실물은 기존 방식대로 중복 제거
+    clean_bodies = solve_overlap(bodies, overlap_thresh=0.3)
     
     # 전원 확인
     power_active = any(p[1] < h * 0.45 for p in pins)
@@ -136,10 +136,12 @@ def analyze_real(img, model):
     
     # 연결 확인
     if power_active:
+        # 직접 연결
         for comp in clean_bodies:
             cy = comp['center'][1]
             if cy < h*0.48 or cy > h*0.52: comp['is_on'] = True
 
+        # 전파 (Propagation)
         for _ in range(2): 
             for comp in clean_bodies:
                 if comp['is_on']: continue 
@@ -159,21 +161,13 @@ def analyze_real(img, model):
 
     off_count = 0
     
-    # 시각화 및 카운트
-    summary_details = {}
     for comp in clean_bodies:
         is_on = comp['is_on']
-        n = comp['normalized_name']
-        
-        # 와이어, 전원 등은 비교 대상에서 제외하거나 포함 여부 결정
-        if 'wire' not in n and 'source' not in n:
-             summary_details[n] = summary_details.get(n, 0) + 1
-
         if is_on:
-            color = (0, 255, 0)
+            color = (0, 255, 0) # ON
             status = "ON"
         else:
-            color = (0, 0, 255)
+            color = (0, 0, 255) # OFF
             status = "OFF"
             off_count += 1
         
@@ -181,13 +175,13 @@ def analyze_real(img, model):
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
         cv2.putText(img, status, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         
-    return img, {'off': off_count, 'total': len(clean_bodies), 'details': summary_details}
+    return img, {'off': off_count, 'total': len(clean_bodies), 'details': {}}
 
 # ==========================================
-# [5. 메인 UI (Streamlit)]
+# [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V5: Strict Verification")
-st.markdown("### 회로도와 실물의 [부품 개수]와 [연결 상태]를 모두 검증합니다.")
+st.title("🧠 BrainBoard V5: Final Fix")
+st.markdown("### 회로도 중복 인식 문제 해결됨")
 
 @st.cache_resource
 def load_models():
@@ -211,37 +205,18 @@ if ref_file and tgt_file:
     ref_cv = cv2.cvtColor(np.array(ref_image), cv2.COLOR_RGB2BGR)
     tgt_cv = cv2.cvtColor(np.array(tgt_image), cv2.COLOR_RGB2BGR)
 
-    if st.button("🚀 정밀 분석 실행"):
+    if st.button("🚀 분석 실행"):
         with st.spinner("분석 중..."):
             res_ref_img, ref_data = analyze_schematic(ref_cv.copy(), model_sym)
             res_tgt_img, tgt_data = analyze_real(tgt_cv.copy(), model_real)
 
             st.divider()
             
-            # [핵심] 비교 로직
-            # 회로도에서 파악된 부품 수와 실물 부품 수를 비교
-            mismatch_errors = []
+            # 결과 이미지 출력
+            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (깔끔하게 보정됨)", use_column_width=True)
+            st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 분석 (OFF 개수: {tgt_data['off']})", use_column_width=True)
             
-            # 비교할 주요 부품 목록
-            check_list = ['resistor', 'capacitor'] 
-            
-            for part in check_list:
-                ref_cnt = ref_data['details'].get(part, 0)
-                tgt_cnt = tgt_data['details'].get(part, 0)
-                
-                if ref_cnt != tgt_cnt:
-                    mismatch_errors.append(f"⚠️ {part.upper()} 개수 불일치: 회로도({ref_cnt}) vs 실물({tgt_cnt})")
-            
-            # 결과 출력
-            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석", use_column_width=True)
-            st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 분석 (OFF: {tgt_data['off']})", use_column_width=True)
-            
-            # 최종 판정
-            if mismatch_errors:
-                st.error("❌ 회로 구성이 일치하지 않습니다 (부품 누락/과잉)")
-                for err in mismatch_errors:
-                    st.write(err)
-            elif tgt_data['off'] > 0:
-                st.error(f"❌ 부품 연결 끊김 발견 ({tgt_data['off']}개 OFF)")
+            if tgt_data['off'] == 0:
+                st.success("✅ 모든 부품 전원 연결 확인됨 (All ON)")
             else:
-                st.success("✅ 완벽합니다! (부품 일치 & 전원 연결 성공)")
+                st.error(f"❌ {tgt_data['off']}개 부품이 연결되지 않았습니다 (OFF)")
