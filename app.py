@@ -11,7 +11,7 @@ from PIL import Image
 st.set_page_config(page_title="BrainBoard V44", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'        # 실제 보드용 모델 경로
-MODEL_SYM_PATH = 'circuit_model_v3.pt' # 회로도용 모델 경로
+MODEL_SYM_PATH = 'symbol.pt'       # 회로도용 모델 경로 (변경됨)
 PROXIMITY_THRESHOLD = 60
 IOU_THRESHOLD = 0.3
 
