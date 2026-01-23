@@ -44,6 +44,18 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.5):
                 dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
                 if dist < dist_thresh:
                     is_dup = True; break
+                    
+            # 3. 포함 관계 체크 (박스 안에 박스 제거)
+            # 큰 박스 안에 작은 박스가 80% 이상 들어가면 중복 처리
+            x1 = max(curr['box'][0], k['box'][0])
+            y1 = max(curr['box'][1], k['box'][1])
+            x2 = min(curr['box'][2], k['box'][2])
+            y2 = min(curr['box'][3], k['box'][3])
+            inter_area = max(0, x2-x1) * max(0, y2-y1)
+            curr_area = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
+            if curr_area > 0 and (inter_area / curr_area) > 0.8:
+                is_dup = True; break
+
         if not is_dup:
             final.append(curr)
     return final
@@ -52,22 +64,37 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석 (기존 성공 로직 유지)]
+# [3. 회로도 분석 (커패시터 전용 로직 적용)]
 # ==========================================
 def analyze_schematic(img, model):
-    # 회로도는 선이 얇으므로 conf를 0.20 정도로 유지 (노이즈 방지 + 인식 확보)
-    res = model.predict(source=img, conf=0.20, verbose=False)
+    # 일단 기준을 최대한 낮춰서(0.1) 다 가져옵니다.
+    res = model.predict(source=img, conf=0.1, verbose=False)
     
     raw = []
     for b in res[0].boxes:
+        cls_id = int(b.cls[0])
+        raw_name = model.names[cls_id].lower()
+        conf = float(b.conf[0])
+        
+        # [핵심 수정] 부품별로 통과 기준을 다르게 적용
+        if 'cap' in raw_name:
+            # 커패시터는 잘 안잡히므로 0.1(10%)만 넘어도 통과!
+            min_conf = 0.10
+        else:
+            # 저항, 소스 등은 엉뚱한거 잡지 않게 0.30(30%) 이상이어야 통과
+            min_conf = 0.30
+            
+        if conf < min_conf:
+            continue # 기준 미달 탈락
+
         raw.append({
-            'name': model.names[int(b.cls[0])].lower(), 
+            'name': raw_name, 
             'box': b.xyxy[0].tolist(), 
             'center': get_center(b.xyxy[0].tolist()),
-            'conf': float(b.conf[0])
+            'conf': conf
         })
     
-    # 중복 제거 (포함 관계 제거를 위해 IoU 기준 낮게 잡음)
+    # 중복 제거 (거리체크 X, 겹침 10% 이상이면 제거)
     clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1)
     
     summary_details = {}
@@ -80,7 +107,8 @@ def analyze_schematic(img, model):
         if p['center'][0] < img.shape[1] * 0.25: name = 'source'
         elif 'cap' in raw_name: name = 'capacitor'
         elif 'res' in raw_name: name = 'resistor'
-        elif 'inductor' in raw_name: name = 'inductor'
+        elif 'ind' in raw_name: name = 'inductor'
+        elif 'dio' in raw_name: name = 'diode'
         
         # 그리기
         x1, y1, x2, y2 = map(int, p['box'])
@@ -92,14 +120,11 @@ def analyze_schematic(img, model):
     return img, {'total': len(clean), 'details': summary_details}
 
 # ==========================================
-# [4. 실물 분석 (오인식 해결을 위한 수정)]
+# [4. 실물 분석 (완벽함 - 수정 없음)]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
-    
-    # [핵심 수정] conf=0.1 -> 0.25로 상향 조정
-    # 이유: 실물 사진에서는 전선 뭉치나 그림자를 부품으로 오인식하는 경우가 많음.
-    # 기준을 높여서 "확실한 부품"만 카운트하도록 함.
+    # 실물은 노이즈가 많으므로 0.25 유지
     res = model.predict(source=img, conf=0.25, verbose=False)
     
     bodies = []
@@ -111,7 +136,6 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # 핀/와이어 분류
         if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
             pins.append(center) 
         elif 'breadboard' in name:
@@ -119,7 +143,6 @@ def analyze_real(img, model):
         else:
             bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
-    # 중복 제거 (거리 60px)
     clean_bodies = solve_overlap(bodies, dist_thresh=60, iou_thresh=0.3)
     
     # 전원 확인
@@ -129,20 +152,18 @@ def analyze_real(img, model):
             if 'wire' in b['name'] and b['center'][1] < h * 0.45:
                 power_active = True; break
     
-    # 연결 상태 확인
+    # 연결 확인
     if power_active:
-        # 1. 직접 연결
+        # 직접 연결
         for comp in clean_bodies:
             cy = comp['center'][1]
             if cy < h*0.48 or cy > h*0.52: comp['is_on'] = True
 
-        # 2. 전파 (Propagation 2회)
+        # 전파 (2회)
         for _ in range(2): 
             for comp in clean_bodies:
                 if comp['is_on']: continue 
                 cx, cy = comp['center']
-                
-                # 다른 부품 근처
                 for other in clean_bodies:
                     if not other['is_on']: continue
                     ocx, ocy = other['center']
@@ -150,7 +171,6 @@ def analyze_real(img, model):
                     if dist < CONNECTION_THRESHOLD:
                         comp['is_on'] = True; break
                 
-                # 전원 핀 근처
                 if not comp['is_on']:
                     for px, py in pins:
                         if math.sqrt((cx-px)**2 + (cy-py)**2) < CONNECTION_THRESHOLD:
@@ -160,17 +180,14 @@ def analyze_real(img, model):
     off_count = 0
     real_details = {} 
     
-    # 시각화 및 카운팅
     for comp in clean_bodies:
         is_on = comp['is_on']
         raw_name = comp['name']
         
-        # 정규화 및 카운팅
         norm_name = raw_name
         if 'res' in raw_name: norm_name = 'resistor'
         elif 'cap' in raw_name: norm_name = 'capacitor'
         
-        # 와이어는 개수 비교 제외, 나머지는 카운트
         if 'wire' not in raw_name:
             real_details[norm_name] = real_details.get(norm_name, 0) + 1
 
