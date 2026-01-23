@@ -16,7 +16,7 @@ MODEL_SYM_PATH = 'symbol.pt'     # 회로도 기호 분석용
 CONNECTION_THRESHOLD = 100       
 
 # ==========================================
-# [2. 유틸리티 함수 (중복 제거 및 좌표 계산)]
+# [2. 유틸리티 함수 (NMS: 중복 제거)]
 # ==========================================
 def calculate_iou(box1, box2):
     """두 박스의 겹치는 비율(IoU) 계산"""
@@ -27,9 +27,11 @@ def calculate_iou(box1, box2):
     union = area1 + area2 - inter
     return inter / union if union > 0 else 0
 
-def solve_overlap(parts, dist_thresh=30, iou_thresh=0.3):
+def solve_overlap(parts, dist_thresh=0, iou_thresh=0.5):
     """
-    기능: 겹치는 박스들을 정리 (거리 + IoU 기준)
+    기능: 겹치는 박스들을 정리
+    - dist_thresh: 중심점 거리가 이보다 가까우면 중복 (0이면 거리 체크 안 함)
+    - iou_thresh: 겹치는 면적이 이 비율보다 크면 중복
     """
     if not parts: return []
     # 신뢰도 높은 순 정렬
@@ -40,14 +42,17 @@ def solve_overlap(parts, dist_thresh=30, iou_thresh=0.3):
     for curr in parts:
         is_dup = False
         for k in final:
-            # 1. 중심점 거리 계산
-            dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
-            # 2. 겹치는 면적 계산 (IoU)
+            # 1. 겹치는 면적 계산 (IoU)
             iou = calculate_iou(curr['box'], k['box'])
-            
-            # 거리가 매우 가깝거나, 면적이 많이 겹치면 중복으로 간주
-            if dist < dist_thresh or iou > iou_thresh:
+            if iou > iou_thresh:
                 is_dup = True; break
+            
+            # 2. 중심점 거리 계산 (옵션)
+            if dist_thresh > 0:
+                dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
+                if dist < dist_thresh:
+                    is_dup = True; break
+                    
         if not is_dup:
             final.append(curr)
     return final
@@ -56,13 +61,11 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석 (오인식 감소를 위해 conf 상향 조정)]
+# [3. 회로도 분석 (수정됨: 놓치는 부품 없도록 완화)]
 # ==========================================
 def analyze_schematic(img, model):
-    # [수정 핵심] 엉뚱한 커패시터 인식을 막기 위해 신뢰도(conf)를 0.05 -> 0.25로 상향
-    # 이 값을 높일수록 AI가 확실한 것만 잡습니다. (오인식 감소, 미인식 증가 가능성 있음)
-    conf_threshold = 0.25 
-    res = model.predict(source=img, conf=conf_threshold, verbose=False)
+    # [수정] 다시 0.1로 낮춰서 놓치는 부품(커패시터 등)을 확실히 잡게 함
+    res = model.predict(source=img, conf=0.1, verbose=False)
     
     raw = []
     for b in res[0].boxes:
@@ -73,8 +76,10 @@ def analyze_schematic(img, model):
             'conf': float(b.conf[0])
         })
     
-    # 중복 제거 (거리 30px 또는 IoU 0.3 이상이면 제거)
-    clean = solve_overlap(raw, dist_thresh=30, iou_thresh=0.3)
+    # [수정] 중복 제거 로직 완화
+    # dist_thresh=0: 거리가 가까워도 겹치지만 않으면 지우지 않음 (병렬 연결 인식)
+    # iou_thresh=0.45: 절반 가까이 겹쳐야만 중복으로 간주
+    clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.45)
     
     for p in clean:
         name = p['name']
@@ -95,7 +100,7 @@ def analyze_schematic(img, model):
     return img, summary
 
 # ==========================================
-# [4. 실물 분석 (변경 없음 - 기존 로직 유지)]
+# [4. 실물 분석 (변경 없음: 기존 기능 유지)]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
@@ -110,16 +115,16 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # 핀 분류 (좌표용)
+        # 핀 분류
         if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
             pins.append(center) 
         elif 'breadboard' in name:
             continue
         else:
-            # bodies: 저항, 커패시터, 와이어 등 모든 부품
             bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
-    clean_bodies = solve_overlap(bodies, 60)
+    # 실물은 거리 기반 중복 제거 유지 (60px)
+    clean_bodies = solve_overlap(bodies, dist_thresh=60, iou_thresh=0.3)
     
     # [1단계] 전원 레일 활성화 확인
     power_active = any(p[1] < h * 0.45 for p in pins)
@@ -128,30 +133,29 @@ def analyze_real(img, model):
             if 'wire' in b['name'] and b['center'][1] < h * 0.45:
                 power_active = True; break
     
-    # [2단계] 연결 상태 판단 (전파 로직 적용)
+    # [2단계] 연결 상태 판단 (전파 로직)
     if power_active:
-        # 1. 직접 연결
+        # 직접 연결
         for comp in clean_bodies:
             cy = comp['center'][1]
             if cy < h*0.48 or cy > h*0.52: 
                 comp['is_on'] = True
 
-        # 2. 간접 연결 (Propagation - 2회 반복)
+        # 간접 연결 (Propagation 2회)
         for _ in range(2): 
             for comp in clean_bodies:
                 if comp['is_on']: continue 
-                
-                # 내 근처에 켜진 부품 확인
                 cx, cy = comp['center']
+                
+                # 다른 켜진 부품 근처
                 for other in clean_bodies:
                     if not other['is_on']: continue
                     ocx, ocy = other['center']
                     dist = math.sqrt((cx-ocx)**2 + (cy-ocy)**2)
                     if dist < CONNECTION_THRESHOLD:
-                        comp['is_on'] = True
-                        break
+                        comp['is_on'] = True; break
                 
-                # 내 근처에 전원 핀 확인
+                # 전원 핀 근처
                 if not comp['is_on']:
                     for px, py in pins:
                         if math.sqrt((cx-px)**2 + (cy-py)**2) < CONNECTION_THRESHOLD:
