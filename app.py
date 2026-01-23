@@ -8,7 +8,7 @@ from PIL import Image
 # ==========================================
 # [1. 설정 및 라이브러리]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V7 Final", layout="wide")
+st.set_page_config(page_title="BrainBoard V8 (Source/Res Tuned)", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'      # 실물 브레드보드 분석용
 MODEL_SYM_PATH = 'symbol.pt'     # 회로도 기호 분석용
@@ -34,18 +34,19 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.5):
     for curr in parts:
         is_dup = False
         for k in final:
-            # 1. IoU 체크
+            # 1. IoU(면적 겹침) 체크
             iou = calculate_iou(curr['box'], k['box'])
             if iou > iou_thresh:
                 is_dup = True; break
             
-            # 2. 포함 관계 체크
+            # 2. 포함 관계 체크 (큰 박스 안에 작은 박스 제거)
             x1 = max(curr['box'][0], k['box'][0])
             y1 = max(curr['box'][1], k['box'][1])
             x2 = min(curr['box'][2], k['box'][2])
             y2 = min(curr['box'][3], k['box'][3])
             inter_area = max(0, x2-x1) * max(0, y2-y1)
             curr_area = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
+            
             if curr_area > 0 and (inter_area / curr_area) > 0.8:
                 is_dup = True; break
 
@@ -63,9 +64,10 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석 (기존 로직 유지)]
+# [3. 회로도 분석 (저항/전원 기준 상향)]
 # ==========================================
 def analyze_schematic(img, model):
+    # 1. 기본 스캔
     res = model.predict(source=img, conf=0.01, verbose=False)
     
     raw = []
@@ -74,11 +76,13 @@ def analyze_schematic(img, model):
         raw_name = model.names[cls_id].lower()
         conf = float(b.conf[0])
         
-        # 회로도용 부품별 기준
-        if 'cap' in raw_name or 'source' in raw_name or 'volt' in raw_name or 'batt' in raw_name:
-            min_conf = 0.10  
+        # [핵심 수정] 회로도 부품별 기준 상향 조정
+        if 'cap' in raw_name:
+            min_conf = 0.20  # 커패시터: 0.20 유지
         elif 'res' in raw_name:
-            min_conf = 0.25  
+            min_conf = 0.35  # [UP] 저항: 0.25 -> 0.35 (더 엄격하게)
+        elif 'source' in raw_name or 'volt' in raw_name or 'batt' in raw_name:
+            min_conf = 0.25  # [UP] 전원: 0.10 -> 0.25 (오인식 방지)
         else:
             min_conf = 0.20
             
@@ -93,6 +97,7 @@ def analyze_schematic(img, model):
     
     clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1)
     
+    # [강력 보정] 가장 왼쪽에 있는 부품 = Source
     leftmost_idx = -1
     min_x = float('inf')
     
@@ -106,8 +111,9 @@ def analyze_schematic(img, model):
     
     for i, p in enumerate(clean):
         raw_name = p['name']
-        name = raw_name 
+        name = raw_name # 기본값
         
+        # 이름 정규화
         if 'cap' in raw_name: name = 'capacitor'
         elif 'res' in raw_name: name = 'resistor'
         elif 'ind' in raw_name: name = 'inductor'
@@ -117,8 +123,10 @@ def analyze_schematic(img, model):
         if i == leftmost_idx:
             name = 'source'
         
+        # 그리기
         x1, y1, x2, y2 = map(int, p['box'])
         box_color = (255, 0, 0) if name == 'source' else (0, 0, 255)
+        
         cv2.rectangle(img, (x1, y1), (x2, y2), box_color, 2)
         cv2.putText(img, name, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
         
@@ -127,12 +135,12 @@ def analyze_schematic(img, model):
     return img, {'total': len(clean), 'details': summary_details}
 
 # ==========================================
-# [4. 실물 분석 (부품 구분 강화 적용)]
+# [4. 실물 분석 (V7 로직 유지)]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
-    # 1. 일단 낮은 기준으로 모든 후보를 가져옵니다.
-    res = model.predict(source=img, conf=0.1, verbose=False)
+    # 1. 1차 스캔
+    res = model.predict(source=img, conf=0.10, verbose=False)
     
     bodies = []
     pins = []
@@ -143,15 +151,18 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # [핵심 수정] 실물 부품별 차등 기준 적용
-        if 'cap' in name: min_conf = 0.45   # 커패시터는 아주 엄격하게 (오인식 방지)
-        elif 'res' in name: min_conf = 0.35 # 저항은 적당히 엄격하게
-        elif 'wire' in name or 'pin' in name: min_conf = 0.15 # 와이어/핀은 낮게
-        else: min_conf = 0.25 # 그 외
+        # 실물 부품별 맞춤 임계값 (V7 유지)
+        if 'cap' in name:
+            min_conf = 0.45  # 커패시터: 엄격
+        elif 'res' in name:
+            min_conf = 0.30  # 저항: 보통
+        elif 'wire' in name or 'pin' in name:
+            min_conf = 0.15  # 와이어: 낮게
+        else:
+            min_conf = 0.25
+            
+        if conf < min_conf: continue 
 
-        if conf < min_conf: continue # 기준 미달 탈락
-
-        # 핀/와이어 분류
         if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
             pins.append(center) 
         elif 'breadboard' in name:
@@ -194,17 +205,14 @@ def analyze_real(img, model):
     off_count = 0
     real_details = {} 
     
-    # 시각화 및 카운팅
     for comp in clean_bodies:
         is_on = comp['is_on']
         raw_name = comp['name']
         
-        # 정규화
         norm_name = raw_name
         if 'res' in raw_name: norm_name = 'resistor'
         elif 'cap' in raw_name: norm_name = 'capacitor'
         
-        # 와이어는 개수 비교 제외
         if 'wire' not in raw_name:
             real_details[norm_name] = real_details.get(norm_name, 0) + 1
 
@@ -223,10 +231,10 @@ def analyze_real(img, model):
     return img, {'off': off_count, 'total': len(clean_bodies), 'details': real_details}
 
 # ==========================================
-# [5. 메인 UI (Streamlit)]
+# [5. 메인 UI]
 # ==========================================
-# [확인] 제목이 V7로 바뀌어야 합니다!
-st.title("🧠 BrainBoard V7 (실물 부품 구분 강화)")
+# [확인] 제목이 V8로 바뀌었는지 확인하세요
+st.title("🧠 BrainBoard V8 (Source/Res Tuned)")
 st.markdown("### 1. 부품 일치 여부 확인")
 st.markdown("### 2. 전원 연결 상태(ON/OFF) 확인")
 
@@ -274,7 +282,6 @@ if ref_file and tgt_file:
             st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석", use_column_width=True)
             st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 분석 (OFF: {tgt_data['off']})", use_column_width=True)
             
-            # 최종 결과
             if mismatch_errors:
                 st.error("❌ 회로 구성이 다릅니다 (부품 개수 불일치)")
                 for err in mismatch_errors:
