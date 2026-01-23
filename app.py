@@ -1,464 +1,212 @@
-import streamlit as st
 import cv2
 import numpy as np
 from ultralytics import YOLO
+import sys
 import math
-from PIL import Image
+import tkinter as tk
+from tkinter import filedialog
 
 # ==========================================
 # [설정 및 상수]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V44", layout="wide")
-
-MODEL_REAL_PATH = 'best.pt'        # 실제 보드용 모델 경로
-MODEL_SYM_PATH = 'symbol.pt'       # 회로도용 모델 경로 (변경됨)
-PROXIMITY_THRESHOLD = 60
-IOU_THRESHOLD = 0.3
-
-CONFIDENCE_MAP = {
-    'led': 0.60, 'capacitor': 0.45, 'voltage': 0.25,
-    'source': 0.25, 'resistor': 0.50, 'wire': 0.35, 'default': 0.35
-}
-
-# [NEW] 60x10 브레드보드 논리 모델 클래스
-class Breadboard60x10:
-    def __init__(self):
-        self.width = 60    # 가로 60칸 (0~59)
-        self.height = 10   # 세로 10칸 (0~9)
-        self.split_index = 5 # 0~4(Top)와 5~9(Bottom) 분리 기준
-
-    def get_node_id(self, x, y):
-        """좌표(x,y)를 입력받아 전기적 노드 ID 반환"""
-        if not (0 <= x < self.width and 0 <= y < self.height):
-            return "OUT" # 보드 밖
-        
-        # 세로줄(x)이 같으면 연결, 단 중앙 분리대(y=5) 기준 상하 분리
-        if y < self.split_index:
-            return f"Node_{x}_Top"
-        else:
-            return f"Node_{x}_Bottom"
-
-    def check_is_short(self, pin1, pin2):
-        """두 핀이 같은 노드에 연결되어 합선인지 확인 (True=합선)"""
-        node1 = self.get_node_id(*pin1)
-        node2 = self.get_node_id(*pin2)
-        
-        # 둘 중 하나라도 보드 밖이면 판단 유보(False)
-        if node1 == "OUT" or node2 == "OUT": 
-            return False
-            
-        # 노드 ID가 같으면 합선
-        return (node1 == node2)
+MODEL_REAL_PATH = 'best.pt'    # 실물 보드용 모델
+MODEL_SYM_PATH = 'symbol.pt'   # 회로도용 모델
+PIN_SENSITIVITY = 140          # 핀과 부품 간 연결 감지 범위 (픽셀 단위)
 
 # ==========================================
 # [Helper Functions]
 # ==========================================
-def calculate_iou(box1, box2):
-    x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    union = area1 + area2 - inter
-    return inter / union if union > 0 else 0
-
-def non_max_suppression(boxes, iou_thresh):
-    if not boxes: return []
-    kept = []
-    for curr in boxes:
-        is_dup = False
-        for k in kept:
-            if calculate_iou(curr['box'], k['box']) > iou_thresh: is_dup = True; break
-        if not is_dup: kept.append(curr)
-    return kept
-
-def get_center(box):
-    return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
-
-def is_near_box(point, box, margin=25):
-    px, py = point
-    return (box[0]-margin) < px < (box[2]+margin) and (box[1]-margin) < py < (box[3]+margin)
-
-def is_valid_size(box, img_w, img_h):
-    x1, y1, x2, y2 = box
-    w, h = x2 - x1, y2 - y1
-    if (w * h) < (img_w * img_h * 0.001): return False
-    return True
-
-def is_valid_resistor_size(box, img_w, img_h):
-    x1, y1, x2, y2 = box
-    w, h = x2 - x1, y2 - y1
-    if (w * h) > (img_w * img_h * 0.05): return False
-    return True
-
-def is_intersecting(boxA, boxB):
-    xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
-    xB, yB = min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
-    return max(0, xB - xA) * max(0, yB - yA) > 0
-
-def solve_overlap(parts, distance_threshold=60):
+def solve_overlap(parts, dist_thresh=60):
+    """
+    중복 감지된 객체들을 거리 기준으로 필터링 (Conf 높은 것 우선)
+    """
     if not parts: return []
+    # conf(신뢰도)가 높은 순서대로 정렬
     if 'conf' in parts[0]:
-        parts.sort(key=lambda x: x['conf'], reverse=True)
-    final_parts = []
-    for current in parts:
-        is_duplicate = False
-        for kept in final_parts:
-            iou = calculate_iou(current['box'], kept['box'])
-            cx1, cy1 = current['center']
-            cx2, cy2 = kept['center']
-            dist = math.sqrt((cx1-cx2)**2 + (cy1-cy2)**2)
-            if iou > 0.1 or dist < distance_threshold:
-                is_duplicate = True; break
-        if not is_duplicate:
-            final_parts.append(current)
-    return final_parts
-
-# [NEW] 픽셀 좌표 -> 60x10 그리드 좌표 변환
-def map_pixel_to_grid(px, py, img_w, img_h):
-    # 사진에서 브레드보드가 차지하는 영역 가정 (여백 조정 필요)
-    margin_x = img_w * 0.05  # 좌측 여백 5%
-    margin_y = img_h * 0.15  # 상단 여백 15%
-    board_w = img_w * 0.90   # 보드 가로폭 90%
-    board_h = img_h * 0.70   # 보드 세로폭 70%
+        parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
-    rel_x = (px - margin_x) / board_w
-    rel_y = (py - margin_y) / board_h
-    
-    grid_x = int(rel_x * 60)
-    grid_y = int(rel_y * 10)
-    
-    # 좌표 클램핑 (0~59, 0~9)
-    grid_x = max(0, min(59, grid_x))
-    grid_y = max(0, min(9, grid_y))
-    
-    return (grid_x, grid_y)
+    final = []
+    for curr in parts:
+        # 이미 등록된 부품들과 너무 가까우면(중복이면) 건너뜀
+        if not any(math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2) < dist_thresh for k in final):
+            final.append(curr)
+    return final
 
 # ==========================================
-# [분석 함수]
+# [분석 함수 1: 회로도 (Schematic)]
 # ==========================================
-def analyze_schematic(img, model):
-    results = model.predict(source=img, save=False, conf=0.15, verbose=False)
-    boxes = results[0].boxes
-    raw_parts = []
+def analyze_schematic(img_path, model):
+    img = cv2.imread(img_path)
+    if img is None: return None
     
-    for box in boxes:
-        cls_id = int(box.cls[0])
-        name = model.names[cls_id].lower()
-        conf = float(box.conf[0])
-        coords = box.xyxy[0].tolist()
-        center = get_center(coords)
+    # 모델 추론
+    res = model.predict(source=img, conf=0.15, verbose=False)
+    
+    raw = []
+    for b in res[0].boxes:
+        raw.append({
+            'name': model.names[int(b.cls[0])].lower(), 
+            'box': b.xyxy[0].tolist(), 
+            'center': ((b.xyxy[0][0]+b.xyxy[0][2])/2, (b.xyxy[0][1]+b.xyxy[0][3])/2),
+            'conf': float(b.conf[0])
+        })
+    
+    clean = solve_overlap(raw)
+    
+    for p in clean:
+        name = p['name']
+        # 가장 왼쪽 부품을 전원(Source)으로 강제 지정 (회로도 특성상)
+        if p['center'][0] < img.shape[1] * 0.25: name = 'source'
+        elif 'cap' in name: name = 'capacitor'
+        elif 'res' in name: name = 'resistor'
         
-        base_name = name.split('_')[0].split(' ')[0]
-        if base_name in ['vdc', 'vsource', 'battery', 'voltage']: base_name = 'source'
-        if base_name in ['cap', 'c', 'capacitor']: base_name = 'capacitor'
-        if base_name in ['res', 'r', 'resistor']: base_name = 'resistor'
-        
-        raw_parts.append({'name': base_name, 'box': coords, 'center': center, 'conf': conf})
-
-    clean_parts = solve_overlap(raw_parts)
-
-    if clean_parts:
-        leftmost_part = min(clean_parts, key=lambda p: p['center'][0])
-        if leftmost_part['name'] != 'source':
-            leftmost_part['name'] = 'source'
-
-    summary = {'total': 0, 'details': {}}
-    for part in clean_parts:
-        name = part['name']
-        x1, y1, x2, y2 = map(int, part['box'])
+        x1, y1, x2, y2 = map(int, p['box'])
         cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        cv2.putText(img, name, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-        
-        summary['total'] += 1
-        summary['details'][name] = summary['details'].get(name, 0) + 1
-        
-    return img, summary
+        cv2.putText(img, name, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    return img
 
-def analyze_real(img, model):
-    height, width, _ = img.shape
-    results = model.predict(source=img, save=False, conf=0.1, verbose=False)
-    boxes = results[0].boxes
-
-    # [NEW] 브레드보드 논리 객체 생성
-    logic_board = Breadboard60x10()
-
-    raw_objects = {'body': [], 'leg': [], 'hole': [], 'plus': [], 'minus': []}
+# ==========================================
+# [분석 함수 2: 실물 (Real Board)]
+# ==========================================
+def analyze_real(img_path, model):
+    img = cv2.imread(img_path)
+    if img is None: return None, 0
+    h, w, _ = img.shape
     
-    for box in boxes:
-        cls_id = int(box.cls[0])
-        name = model.names[cls_id].lower()
-        conf = float(box.conf[0])
+    # 모델 추론
+    res = model.predict(source=img, conf=0.1, verbose=False)
+    
+    bodies = [] # 시각화할 부품 (몸체 + 와이어)
+    pins = []   # 연결 확인용 핀 (다리) - 화면엔 안 그림
+    
+    for b in res[0].boxes:
+        name = model.names[int(b.cls[0])].lower()
+        coords = b.xyxy[0].tolist()
+        center = ((coords[0]+coords[2])/2, (coords[1]+coords[3])/2)
+        conf = float(b.conf[0])
         
-        threshold = CONFIDENCE_MAP.get('default')
-        for key in CONFIDENCE_MAP:
-            if key in name: threshold = CONFIDENCE_MAP[key]; break
+        # [수정된 핵심 로직] 
+        # 'wire'는 핀 리스트에서 제외하고 bodies(시각화 대상)로 분류
         
-        if conf < threshold: continue
-        if name in ['breadboard', 'text']: continue
+        # 1. 핀/다리(Leg) 처리 -> 화면에 안 그리고 좌표 계산용으로만 사용
+        if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
+            pins.append(center)
         
-        coords = box.xyxy[0].tolist()
-        if not is_valid_size(coords, width, height): continue
-        if 'resistor' in name or 'capacitor' in name:
-             if not is_valid_resistor_size(coords, width, height): continue
-
-        item = {'name': name, 'box': coords, 'center': get_center(coords), 'conf': conf}
-        
-        if any(x in name for x in ['pin', 'leg', 'lead']): raw_objects['leg'].append(item)
-        elif 'hole' in name: raw_objects['hole'].append(item)
-        elif any(x in name for x in ['plus', 'positive', 'vcc', '5v']): raw_objects['plus'].append(item)
-        elif any(x in name for x in ['minus', 'negative', 'gnd']): raw_objects['minus'].append(item)
-        else: raw_objects['body'].append(item)
-
-    clean_bodies = solve_overlap(raw_objects['body'], distance_threshold=60)
-    objects = {'body': clean_bodies, 'leg': non_max_suppression(raw_objects['leg'], IOU_THRESHOLD)}
-
-    # Virtual Rails
-    virtual_rails = {'plus': [], 'minus': []}
-    virtual_rails['plus'].append({'box': [0, 0, width, height*0.15], 'type': 'VCC (Top)'})
-    virtual_rails['minus'].append({'box': [0, height*0.70, width, height], 'type': 'GND (Bottom)'})
-    virtual_rails['plus'].append({'box': [0, 0, width*0.15, height], 'type': 'VCC (Left)'})
-
-    # Draw Rails
-    for r in virtual_rails['minus']:
-        x1, y1, x2, y2 = map(int, r['box'])
-        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 200, 0), 2)
-    for r in virtual_rails['plus']:
-        x1, y1, x2, y2 = map(int, r['box'])
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 2)
-
-    components = []
-    detected_power_wires = 0
-    short_circuit_count = 0 # [NEW] 합선 카운트
-
-    # Body-Leg Association
-    for body in objects['body']:
-        bx, by = body['center']
-        dists = []
-        for leg in objects['leg']:
-            lx, ly = leg['center']
-            d = math.sqrt((bx-lx)**2 + (by-ly)**2)
-            dists.append((d, leg))
-        dists.sort(key=lambda x: x[0])
-        
-        bw, bh = body['box'][2]-body['box'][0], body['box'][3]-body['box'][1]
-        max_d = math.sqrt(bw**2 + bh**2) * 2.5
-        my_legs = [leg for d, leg in dists[:2] if d < max_d]
-        
-        # Fallback for missing legs
-        if 'wire' in body['name']: pass
-        else:
-            if len(my_legs) < 2:
-                x1, y1, x2, y2 = body['box']
-                if bh > bw:
-                    f1={'center':((x1+x2)/2,y1),'box':[x1,y1,x2,y1],'name':'virt'}
-                    f2={'center':((x1+x2)/2,y2),'box':[x1,y2,x2,y2],'name':'virt'}
-                else:
-                    f1={'center':(x1,(y1+y2)/2),'box':[x1,y1,x1,y2],'name':'virt'}
-                    f2={'center':(x2,(y1+y2)/2),'box':[x2,y1,x2,y2],'name':'virt'}
-                if len(my_legs)==0: my_legs=[f1,f2]
-                elif len(my_legs)==1: my_legs.append(f2)
-        
-        # [NEW] 합선(Short Circuit) 검사
-        is_shorted = False
-        if len(my_legs) >= 2:
-            # 픽셀 좌표를 그리드 좌표로 변환
-            p1 = map_pixel_to_grid(*my_legs[0]['center'], width, height)
-            p2 = map_pixel_to_grid(*my_legs[1]['center'], width, height)
-            
-            # 논리 모델로 체크
-            if logic_board.check_is_short(p1, p2):
-                is_shorted = True
-                short_circuit_count += 1
-
-        components.append({'body': body, 'legs': my_legs, 'is_active': False, 'is_shorted': is_shorted})
-
-    # Connectivity Check
-    for comp in components:
-        # 합선된 부품은 전원이 연결되어도 무조건 비정상 처리 (추후 시각화에서 처리)
-        is_power_connected = False
-        for leg in comp['legs']:
-            leg['is_terminated'] = False
-            leg['node'] = None
-            for vcc in virtual_rails['plus']:
-                if is_near_box(leg['center'], vcc['box'], margin=PROXIMITY_THRESHOLD):
-                    leg['node'] = "VCC"; leg['is_terminated'] = True; is_power_connected = True; break
-            if not leg['is_terminated']:
-                for gnd in virtual_rails['minus']:
-                    if is_near_box(leg['center'], gnd['box'], margin=PROXIMITY_THRESHOLD):
-                        leg['node'] = "GND"; leg['is_terminated'] = True; is_power_connected = True; break
-            if not leg['is_terminated']:
-                for other in components:
-                    if other == comp: continue
-                    for o_leg in other['legs']:
-                        d = math.sqrt((leg['center'][0]-o_leg['center'][0])**2 + (leg['center'][1]-o_leg['center'][1])**2)
-                        if d < PROXIMITY_THRESHOLD:
-                            leg['is_terminated'] = True
-                            cv2.line(img, (int(leg['center'][0]), int(leg['center'][1])),
-                                     (int(o_leg['center'][0]), int(o_leg['center'][1])), (0, 255, 255), 3)
-                            break
-                    if leg['is_terminated']: break
-        
-        if 'wire' in comp['body']['name']:
-            wire_box = comp['body']['box']
-            for rail in virtual_rails['plus'] + virtual_rails['minus']:
-                if is_intersecting(wire_box, rail['box']):
-                    is_power_connected = True; break
-        
-        if is_power_connected:
-            comp['is_active'] = True
-            if 'wire' in comp['body']['name']: detected_power_wires += 1
-
-    # Propagation
-    active_nodes = set(["VCC"]); changed = True
-    while changed:
-        changed = False
-        for comp in components:
-            if comp['is_active']: continue
-            connected = False
-            other_nodes = []
-            for leg in comp['legs']:
-                if leg['node'] in active_nodes: connected = True
-                elif leg['node'] and leg['node'] != "GND": other_nodes.append(leg['node'])
-            if not connected:
-                for leg in comp['legs']:
-                    for ac in [c for c in components if c['is_active']]:
-                        for al in ac['legs']:
-                            d = math.sqrt((leg['center'][0]-al['center'][0])**2 + (leg['center'][1]-al['center'][1])**2)
-                            if d < PROXIMITY_THRESHOLD: connected = True; break
-                        if connected: break
-                    if connected: break
-            if connected:
-                comp['is_active'] = True; changed = True
-                for n in other_nodes:
-                    if n not in active_nodes: active_nodes.add(n)
-
-    # Floating Check & Short Check Override
-    for comp in components:
-        # 합선된 부품은 강제로 OFF 처리
-        if comp['is_shorted']:
-            comp['is_active'] = False
+        # 2. 브레드보드 배경 제외
+        elif 'breadboard' in name:
             continue
-
-        if 'wire' in comp['body']['name'] and comp['is_active']: continue
-        if comp['is_active']:
-            all_legs_connected = True
-            for leg in comp['legs']:
-                if not leg.get('is_terminated', False): all_legs_connected = False; break
-            if 'wire' in comp['body']['name'] and len(comp['legs']) < 2: all_legs_connected = False
-            if not all_legs_connected: comp['is_active'] = False
-
-    summary = {'total': 0, 'on': 0, 'off': 0, 'short': short_circuit_count, 'details': {}}
-    if detected_power_wires > 0: summary['details']['source'] = {'count': 1}
-
-    # Visualization
-    for comp in components:
-        name = comp['body']['name']
-        x1, y1, x2, y2 = map(int, comp['body']['box'])
-        
-        # [NEW] 상태별 색상 및 텍스트 설정
-        if comp['is_shorted']:
-            color = (0, 0, 255) # 빨간색 (합선)
-            status = "SHORT!"
-            # 합선 시각화 (두 다리 연결)
-            if len(comp['legs']) >= 2:
-                lx1, ly1 = map(int, comp['legs'][0]['center'])
-                lx2, ly2 = map(int, comp['legs'][1]['center'])
-                cv2.line(img, (lx1, ly1), (lx2, ly2), (0, 0, 255), 4) # 두꺼운 빨간선
-        elif comp['is_active']:
-            color = (0, 255, 0) # 초록색 (ON)
-            status = "ON"
-        else:
-            color = (0, 0, 255) # 빨간색 (OFF)
-            status = "OFF"
-
-        thickness = 3
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
-        text_pos = (x1, y1 - 10) if y1 > 25 else (x1, y2 + 25)
-        cv2.putText(img, status, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        
-        if 'wire' in name:
-             for leg in comp['legs']:
-                lx, ly = map(int, leg['center'])
-                cv2.rectangle(img, (lx-10, ly-10), (lx+10, ly+10), color, 2)
-        
-        summary['total'] += 1
-        if comp['is_active']: summary['on'] += 1
-        else: summary['off'] += 1
-
-        base_name = name.split('_')[0].split(' ')[0]
-        if base_name in ['voltage', 'source', 'battery']: base_name = 'source'
-        if base_name in ['cap', 'c', 'capacitor']: base_name = 'capacitor'
-        if base_name in ['res', 'r', 'resistor']: base_name = 'resistor'
-        
-        if base_name not in summary['details']: summary['details'][base_name] = {'count': 0}
-        summary['details'][base_name]['count'] += 1
-
-    return img, summary
-
-# ==========================================
-# [WEB APP UI] Streamlit Main Code
-# ==========================================
-st.title("🧠 BrainBoard V44: AI Circuit Verifier")
-st.markdown("### PSpice 회로도와 실제 브레드보드(60x10) 사진을 업로드하세요.")
-
-@st.cache_resource
-def load_models():
-    return YOLO(MODEL_REAL_PATH), YOLO(MODEL_SYM_PATH)
-
-try:
-    model_real, model_sym = load_models()
-    st.sidebar.success("✅ AI 모델 로드 완료!")
-except Exception as e:
-    st.error(f"모델 파일을 찾을 수 없습니다: {e}")
-    st.stop()
-
-col1, col2 = st.columns(2)
-ref_file = col1.file_uploader("1. 회로도(Schematic) 업로드", type=['jpg', 'png', 'jpeg'])
-tgt_file = col2.file_uploader("2. 실물(Real Board) 업로드", type=['jpg', 'png', 'jpeg'])
-
-if ref_file and tgt_file:
-    ref_image = Image.open(ref_file)
-    tgt_image = Image.open(tgt_file)
-    ref_cv = cv2.cvtColor(np.array(ref_image), cv2.COLOR_RGB2BGR)
-    tgt_cv = cv2.cvtColor(np.array(tgt_image), cv2.COLOR_RGB2BGR)
-
-    if st.button("🚀 회로 검증 시작 (Analyze)"):
-        with st.spinner("AI가 회로를 분석 중입니다..."):
-            res_ref_img, ref_data = analyze_schematic(ref_cv.copy(), model_sym)
-            res_tgt_img, tgt_data = analyze_real(tgt_cv.copy(), model_real)
-
-            issues = []
-            all_parts = set(ref_data['details'].keys()) | set(tgt_data['details'].keys())
-            counts_match = True
             
-            for part in all_parts:
-                if part in ['wire', 'breadboard', 'text']: continue
-                ref_c = ref_data['details'].get(part, 0)
-                tgt_c = tgt_data['details'].get(part, {}).get('count', 0)
-                if ref_c != tgt_c:
-                    issues.append(f"{part.capitalize()} 개수 불일치 (회로도:{ref_c} vs 실물:{tgt_c})")
-                    counts_match = False
+        # 3. 그 외 부품 (저항, 커패시터, 그리고 WIRE 포함) -> 화면에 그림
+        else:
+            bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf})
 
-            # [NEW] 합선 확인 로직 추가
-            short_count = tgt_data.get('short', 0)
-            if short_count > 0:
-                issues.append(f"🚨 위험: 합선(Short) 발견! ({short_count}개 부품이 같은 줄에 연결됨)")
-
-            # 연결 확인 (OFF 부품 확인)
-            # 합선된 부품은 OFF 카운트에도 포함될 수 있으므로 중복 주의 (UI 표시용)
-            off_count = tgt_data['off']
-            if off_count > 0:
-                 issues.append(f"연결 끊김/비정상 부품 발견 ({off_count}개 OFF 또는 SHORT)")
-
-            connection_ok = (off_count == 0) and (short_count == 0)
-
-            st.divider()
-            if counts_match and connection_ok:
-                st.success("🎉 Perfect! 모든 부품 개수와 연결이 정확합니다.")
+    clean_bodies = solve_overlap(bodies, 60)
+    
+    # [전원 활성화 로직]
+    # 1. 핀이 상단 전원 레일(높이의 45% 지점 위쪽)에 있는지 확인
+    power_active = any(p[1] < h * 0.45 for p in pins)
+    
+    # 2. 핀이 감지되지 않았더라도, 'wire'가 상단 전원부에 있다면 전원 ON으로 간주
+    if not power_active:
+        for b in clean_bodies:
+            if 'wire' in b['name'] and b['center'][1] < h * 0.45:
+                power_active = True
+                break
+    
+    off_count = 0
+    
+    for comp in clean_bodies:
+        cx, cy = comp['center']
+        name = comp['name']
+        is_on = False
+        
+        # 와이어는 연결선이므로 주황색으로 표시하고 항상 활성 상태로 간주
+        if 'wire' in name:
+            color = (0, 165, 255) # 주황색 (BGR 순서: Blue=0, Green=165, Red=255)
+            status = "WIRE"
+            is_on = True # 와이어는 OFF 카운트에서 제외
+        else:
+            # 일반 부품 로직
+            if power_active:
+                # A. 부품 자체가 전원 레일 근처(중앙 분리대 위/아래)에 위치
+                if cy < h*0.48 or cy > h*0.52: 
+                    is_on = True
+                else:
+                    # B. 부품 근처에 핀이 있고, 그 핀이 전원 쪽에 연결되어 있는지 확인
+                    for px, py in pins:
+                        if math.sqrt((cx-px)**2 + (cy-py)**2) < PIN_SENSITIVITY:
+                            # 핀의 y좌표가 중앙 영역을 벗어나 있으면(전원 레일 쪽) ON
+                            if py < h*0.48 or py > h*0.52:
+                                is_on = True; break
+            
+            if is_on:
+                color = (0, 255, 0) # 초록 (ON)
+                status = "ON"
             else:
-                st.error("❌ 오류가 발견되었습니다.")
-                for i in issues:
-                    st.write(f"- {i}")
+                color = (0, 0, 255) # 빨강 (OFF)
+                status = "OFF"
+                off_count += 1
+        
+        # 결과 그리기
+        x1, y1, x2, y2 = map(int, comp['box'])
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
+        cv2.putText(img, status, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        
+    return img, off_count
 
-            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="PSpice 회로도 분석", use_column_width=True)
-            st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption="실물 보드 분석 (V44 with Short Check)", use_column_width=True)
+# ==========================================
+# [Main Execution]
+# ==========================================
+if __name__ == "__main__":
+    try:
+        # 윈도우 파일 탐색기 초기화
+        root = tk.Tk()
+        root.withdraw()
+        
+        print("--- BrainBoard V44 실행 ---")
+        
+        print("1. PSpice 회로도 이미지를 선택하세요...")
+        p1 = filedialog.askopenfilename(title="1. PSpice 회로도 선택", filetypes=[("Images", "*.jpg;*.png;*.jpeg")])
+        if not p1: 
+            print("회로도 선택이 취소되었습니다.")
+            sys.exit()
+        
+        print("2. 실물 회로(브레드보드) 이미지를 선택하세요...")
+        p2 = filedialog.askopenfilename(title="2. 실물 사진 선택", filetypes=[("Images", "*.jpg;*.png;*.jpeg")])
+        if not p2: 
+            print("실물 사진 선택이 취소되었습니다.")
+            sys.exit()
+
+        print("분석 모델을 로드하고 있습니다...")
+        m_real = YOLO(MODEL_REAL_PATH)
+        m_sym = YOLO(MODEL_SYM_PATH)
+
+        print("이미지 분석 중...")
+        res1 = analyze_schematic(p1, m_sym)
+        res2, off = analyze_real(p2, m_real)
+
+        # 결과 이미지 병합 (가로로 이어붙이기)
+        if res1 is not None and res2 is not None:
+            h1, w1 = res1.shape[:2]
+            h2, w2 = res2.shape[:2]
+            max_h = max(h1, h2)
+            
+            canvas = np.zeros((max_h, w1 + w2, 3), dtype=np.uint8)
+            canvas[:h1, :w1] = res1
+            canvas[:h2, w1:w1+w2] = res2
+
+            # 화면 크기에 맞춰 리사이징 (폭 1400px 넘으면 축소)
+            if canvas.shape[1] > 1400:
+                scale = 1400 / canvas.shape[1]
+                canvas = cv2.resize(canvas, None, fx=scale, fy=scale)
+
+            print(f"분석 완료! 발견된 비정상(OFF) 부품 수: {off}")
+            cv2.imshow("BrainBoard Verification", canvas)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+            
+    except Exception as e:
+        print(f"오류가 발생했습니다: {e}")
+        import traceback
+        traceback.print_exc()
+        input("엔터를 누르면 종료합니다...")
