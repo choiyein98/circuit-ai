@@ -46,7 +46,6 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.5):
                     is_dup = True; break
                     
             # 3. 포함 관계 체크 (박스 안에 박스 제거)
-            # 큰 박스 안에 작은 박스가 80% 이상 들어가면 중복 처리
             x1 = max(curr['box'][0], k['box'][0])
             y1 = max(curr['box'][1], k['box'][1])
             x2 = min(curr['box'][2], k['box'][2])
@@ -64,10 +63,10 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석 (커패시터 전용 로직 적용)]
+# [3. 회로도 분석 (전원 인식 오류 수정)]
 # ==========================================
 def analyze_schematic(img, model):
-    # 일단 기준을 최대한 낮춰서(0.1) 다 가져옵니다.
+    # 커패시터 놓침 방지를 위해 0.1로 스캔
     res = model.predict(source=img, conf=0.1, verbose=False)
     
     raw = []
@@ -76,16 +75,11 @@ def analyze_schematic(img, model):
         raw_name = model.names[cls_id].lower()
         conf = float(b.conf[0])
         
-        # [핵심 수정] 부품별로 통과 기준을 다르게 적용
-        if 'cap' in raw_name:
-            # 커패시터는 잘 안잡히므로 0.1(10%)만 넘어도 통과!
-            min_conf = 0.10
-        else:
-            # 저항, 소스 등은 엉뚱한거 잡지 않게 0.30(30%) 이상이어야 통과
-            min_conf = 0.30
+        # 커패시터 전용 낮은 기준 적용
+        if 'cap' in raw_name: min_conf = 0.10
+        else: min_conf = 0.30
             
-        if conf < min_conf:
-            continue # 기준 미달 탈락
+        if conf < min_conf: continue
 
         raw.append({
             'name': raw_name, 
@@ -94,17 +88,29 @@ def analyze_schematic(img, model):
             'conf': conf
         })
     
-    # 중복 제거 (거리체크 X, 겹침 10% 이상이면 제거)
     clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1)
     
+    # [핵심 수정] 가장 왼쪽에 있는 부품 찾기 (전원 강제 할당용)
+    leftmost_idx = -1
+    min_x = float('inf')
+    
+    if clean:
+        for i, p in enumerate(clean):
+            if p['center'][0] < min_x:
+                min_x = p['center'][0]
+                leftmost_idx = i
+
     summary_details = {}
     
-    for p in clean:
+    for i, p in enumerate(clean):
         raw_name = p['name']
-        name = raw_name
+        name = raw_name # 기본값
         
-        # 이름 정규화
-        if p['center'][0] < img.shape[1] * 0.25: name = 'source'
+        # [순서 변경] 
+        # 1순위: 가장 왼쪽에 있으면 무조건 'source' (덮어쓰기 방지)
+        if i == leftmost_idx:
+            name = 'source'
+        # 2순위: 그 외 부품 이름 정규화
         elif 'cap' in raw_name: name = 'capacitor'
         elif 'res' in raw_name: name = 'resistor'
         elif 'ind' in raw_name: name = 'inductor'
@@ -120,11 +126,11 @@ def analyze_schematic(img, model):
     return img, {'total': len(clean), 'details': summary_details}
 
 # ==========================================
-# [4. 실물 분석 (완벽함 - 수정 없음)]
+# [4. 실물 분석 (완벽함 - 고정)]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
-    # 실물은 노이즈가 많으므로 0.25 유지
+    # 실물 오인식 방지를 위해 0.25 유지
     res = model.predict(source=img, conf=0.25, verbose=False)
     
     bodies = []
@@ -154,12 +160,10 @@ def analyze_real(img, model):
     
     # 연결 확인
     if power_active:
-        # 직접 연결
         for comp in clean_bodies:
             cy = comp['center'][1]
             if cy < h*0.48 or cy > h*0.52: comp['is_on'] = True
 
-        # 전파 (2회)
         for _ in range(2): 
             for comp in clean_bodies:
                 if comp['is_on']: continue 
