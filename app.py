@@ -34,10 +34,12 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.5):
     for curr in parts:
         is_dup = False
         for k in final:
+            # 1. IoU(면적 겹침) 체크
             iou = calculate_iou(curr['box'], k['box'])
             if iou > iou_thresh:
                 is_dup = True; break
             
+            # 2. 거리 체크 (옵션)
             if dist_thresh > 0:
                 dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
                 if dist < dist_thresh:
@@ -50,11 +52,11 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석]
+# [3. 회로도 분석 (기존 성공 로직 유지)]
 # ==========================================
 def analyze_schematic(img, model):
-    # 커패시터 등 부품 놓침 방지를 위해 낮은 신뢰도 사용
-    res = model.predict(source=img, conf=0.1, verbose=False)
+    # 회로도는 선이 얇으므로 conf를 0.20 정도로 유지 (노이즈 방지 + 인식 확보)
+    res = model.predict(source=img, conf=0.20, verbose=False)
     
     raw = []
     for b in res[0].boxes:
@@ -65,7 +67,8 @@ def analyze_schematic(img, model):
             'conf': float(b.conf[0])
         })
     
-    clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.45)
+    # 중복 제거 (포함 관계 제거를 위해 IoU 기준 낮게 잡음)
+    clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1)
     
     summary_details = {}
     
@@ -73,12 +76,13 @@ def analyze_schematic(img, model):
         raw_name = p['name']
         name = raw_name
         
-        # 이름 정규화 (실물과 비교하기 위해 통일)
+        # 이름 정규화
         if p['center'][0] < img.shape[1] * 0.25: name = 'source'
         elif 'cap' in raw_name: name = 'capacitor'
         elif 'res' in raw_name: name = 'resistor'
+        elif 'inductor' in raw_name: name = 'inductor'
         
-        # 화면 표시 및 카운팅
+        # 그리기
         x1, y1, x2, y2 = map(int, p['box'])
         cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
         cv2.putText(img, name, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
@@ -88,11 +92,15 @@ def analyze_schematic(img, model):
     return img, {'total': len(clean), 'details': summary_details}
 
 # ==========================================
-# [4. 실물 분석 (부품 종류 카운팅 로직 추가됨)]
+# [4. 실물 분석 (오인식 해결을 위한 수정)]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
-    res = model.predict(source=img, conf=0.1, verbose=False)
+    
+    # [핵심 수정] conf=0.1 -> 0.25로 상향 조정
+    # 이유: 실물 사진에서는 전선 뭉치나 그림자를 부품으로 오인식하는 경우가 많음.
+    # 기준을 높여서 "확실한 부품"만 카운트하도록 함.
+    res = model.predict(source=img, conf=0.25, verbose=False)
     
     bodies = []
     pins = []
@@ -103,6 +111,7 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
+        # 핀/와이어 분류
         if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
             pins.append(center) 
         elif 'breadboard' in name:
@@ -110,6 +119,7 @@ def analyze_real(img, model):
         else:
             bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
+    # 중복 제거 (거리 60px)
     clean_bodies = solve_overlap(bodies, dist_thresh=60, iou_thresh=0.3)
     
     # 전원 확인
@@ -121,14 +131,18 @@ def analyze_real(img, model):
     
     # 연결 상태 확인
     if power_active:
+        # 1. 직접 연결
         for comp in clean_bodies:
             cy = comp['center'][1]
             if cy < h*0.48 or cy > h*0.52: comp['is_on'] = True
 
+        # 2. 전파 (Propagation 2회)
         for _ in range(2): 
             for comp in clean_bodies:
                 if comp['is_on']: continue 
                 cx, cy = comp['center']
+                
+                # 다른 부품 근처
                 for other in clean_bodies:
                     if not other['is_on']: continue
                     ocx, ocy = other['center']
@@ -136,6 +150,7 @@ def analyze_real(img, model):
                     if dist < CONNECTION_THRESHOLD:
                         comp['is_on'] = True; break
                 
+                # 전원 핀 근처
                 if not comp['is_on']:
                     for px, py in pins:
                         if math.sqrt((cx-px)**2 + (cy-py)**2) < CONNECTION_THRESHOLD:
@@ -143,17 +158,19 @@ def analyze_real(img, model):
                                 comp['is_on'] = True; break
 
     off_count = 0
-    real_details = {} # [추가됨] 실물 부품 개수 세는 딕셔너리
+    real_details = {} 
     
+    # 시각화 및 카운팅
     for comp in clean_bodies:
         is_on = comp['is_on']
         raw_name = comp['name']
         
-        # 이름 정규화 (회로도와 비교하기 위해)
+        # 정규화 및 카운팅
         norm_name = raw_name
         if 'res' in raw_name: norm_name = 'resistor'
         elif 'cap' in raw_name: norm_name = 'capacitor'
-        # 와이어는 개수 비교 대상에서 보통 제외하므로 카운팅 안 함 (필요하면 추가 가능)
+        
+        # 와이어는 개수 비교 제외, 나머지는 카운트
         if 'wire' not in raw_name:
             real_details[norm_name] = real_details.get(norm_name, 0) + 1
 
@@ -169,15 +186,14 @@ def analyze_real(img, model):
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
         cv2.putText(img, status, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         
-    # [수정됨] details 딕셔너리에 실물 부품 개수를 담아서 리턴
     return img, {'off': off_count, 'total': len(clean_bodies), 'details': real_details}
 
 # ==========================================
-# [5. 메인 UI (Streamlit)]
+# [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V5: Strict Check")
-st.markdown("### 1. 부품 일치 여부 (저항, 커패시터) 확인")
-st.markdown("### 2. 전기적 연결 상태 (ON/OFF) 확인")
+st.title("🧠 BrainBoard V5: Final Verification")
+st.markdown("### 1. 부품 일치 여부 확인")
+st.markdown("### 2. 전원 연결 상태(ON/OFF) 확인")
 
 @st.cache_resource
 def load_models():
@@ -208,9 +224,8 @@ if ref_file and tgt_file:
 
             st.divider()
             
-            # [추가됨] 부품 불일치 검사 로직
+            # 불일치 검사
             mismatch_errors = []
-            # 비교할 부품 목록 (와이어, 전원은 제외하고 핵심 부품만 비교)
             target_parts = ['resistor', 'capacitor']
             
             for part in target_parts:
@@ -224,7 +239,7 @@ if ref_file and tgt_file:
             st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석", use_column_width=True)
             st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 분석 (OFF: {tgt_data['off']})", use_column_width=True)
             
-            # 최종 결과 메시지 출력
+            # 최종 결과
             if mismatch_errors:
                 st.error("❌ 회로 구성이 다릅니다 (부품 개수 불일치)")
                 for err in mismatch_errors:
