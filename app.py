@@ -12,63 +12,60 @@ st.set_page_config(page_title="BrainBoard V5 Final", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'      # 실물 브레드보드 분석용
 MODEL_SYM_PATH = 'symbol.pt'     # 회로도 기호 분석용
-CONNECTION_THRESHOLD = 100       # 연결 감지 거리 (픽셀)
+# 연결 감지 거리 (픽셀) - 와이어와 부품이 이 거리 안에 있으면 연결된 것으로 간주
+CONNECTION_THRESHOLD = 100       
 
 # ==========================================
-# [2. 강력한 중복 제거 함수 (박스 안에 박스 제거)]
+# [2. 유틸리티 함수 (NMS: 중복 제거)]
 # ==========================================
-def solve_overlap(parts, overlap_thresh=0.5):
+def calculate_iou(box1, box2):
+    """두 박스의 겹치는 비율(IoU) 계산"""
+    x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - inter
+    return inter / union if union > 0 else 0
+
+def solve_overlap(parts, dist_thresh=0, iou_thresh=0.5):
     """
-    기능: 겹치거나 포함된 박스를 강력하게 제거 (NMS)
-    - overlap_thresh: 겹치는 비율이 이보다 높으면 중복으로 간주
+    기능: 겹치는 박스들을 정리
+    - dist_thresh: 중심점 거리가 이보다 가까우면 중복 (0이면 거리 체크 안 함)
+    - iou_thresh: 겹치는 면적이 이 비율보다 크면 중복
     """
     if not parts: return []
-    
-    # 1. 신뢰도(conf) 높은 순서대로 정렬 (중요)
-    parts.sort(key=lambda x: x['conf'], reverse=True)
+    # 신뢰도 높은 순 정렬
+    if 'conf' in parts[0]:
+        parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
     final = []
     for curr in parts:
         is_dup = False
-        for kept in final:
-            # 두 박스의 교집합(Intersection) 영역 계산
-            x1 = max(curr['box'][0], kept['box'][0])
-            y1 = max(curr['box'][1], kept['box'][1])
-            x2 = min(curr['box'][2], kept['box'][2])
-            y2 = min(curr['box'][3], kept['box'][3])
+        for k in final:
+            # 1. 겹치는 면적 계산 (IoU)
+            iou = calculate_iou(curr['box'], k['box'])
+            if iou > iou_thresh:
+                is_dup = True; break
             
-            inter_w = max(0, x2 - x1)
-            inter_h = max(0, y2 - y1)
-            inter_area = inter_w * inter_h
-            
-            if inter_area > 0:
-                # 각 박스의 넓이
-                area_curr = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
-                area_kept = (kept['box'][2]-kept['box'][0]) * (kept['box'][3]-kept['box'][1])
-                
-                # [핵심 로직] "작은 박스가 큰 박스 안에 포함되었는지" 확인
-                # 교집합 영역이 작은 박스 넓이의 50% 이상을 차지하면 중복으로 간주
-                min_area = min(area_curr, area_kept)
-                overlap_ratio = inter_area / min_area
-                
-                if overlap_ratio > overlap_thresh:
-                    is_dup = True
-                    break
-        
+            # 2. 중심점 거리 계산 (옵션)
+            if dist_thresh > 0:
+                dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
+                if dist < dist_thresh:
+                    is_dup = True; break
+                    
         if not is_dup:
             final.append(curr)
-            
     return final
 
 def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석 (정상화)]
+# [3. 회로도 분석 (수정됨: 놓치는 부품 없도록 완화)]
 # ==========================================
 def analyze_schematic(img, model):
-    # [수정] 신뢰도를 0.20으로 올려서 노이즈 제거 (너무 낮추면 박스가 난무함)
-    res = model.predict(source=img, conf=0.20, verbose=False)
+    # [수정] 다시 0.1로 낮춰서 놓치는 부품(커패시터 등)을 확실히 잡게 함
+    res = model.predict(source=img, conf=0.1, verbose=False)
     
     raw = []
     for b in res[0].boxes:
@@ -79,8 +76,10 @@ def analyze_schematic(img, model):
             'conf': float(b.conf[0])
         })
     
-    # [수정] 강력한 중복 제거 실행 (겹침 허용치 0.1 -> 조금만 겹쳐도, 혹은 포함되면 제거)
-    clean = solve_overlap(raw, overlap_thresh=0.1)
+    # [수정] 중복 제거 로직 완화
+    # dist_thresh=0: 거리가 가까워도 겹치지만 않으면 지우지 않음 (병렬 연결 인식)
+    # iou_thresh=0.45: 절반 가까이 겹쳐야만 중복으로 간주
+    clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.45)
     
     for p in clean:
         name = p['name']
@@ -90,7 +89,6 @@ def analyze_schematic(img, model):
         elif 'cap' in name: name = 'capacitor'
         elif 'res' in name: name = 'resistor'
         
-        # 시각화
         x1, y1, x2, y2 = map(int, p['box'])
         cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
         cv2.putText(img, name, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
@@ -102,7 +100,7 @@ def analyze_schematic(img, model):
     return img, summary
 
 # ==========================================
-# [4. 실물 분석 (기존 로직 유지)]
+# [4. 실물 분석 (변경 없음: 기존 기능 유지)]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
@@ -117,6 +115,7 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
+        # 핀 분류
         if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
             pins.append(center) 
         elif 'breadboard' in name:
@@ -124,28 +123,31 @@ def analyze_real(img, model):
         else:
             bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
-    # 실물은 기존 방식대로 중복 제거
-    clean_bodies = solve_overlap(bodies, overlap_thresh=0.3)
+    # 실물은 거리 기반 중복 제거 유지 (60px)
+    clean_bodies = solve_overlap(bodies, dist_thresh=60, iou_thresh=0.3)
     
-    # 전원 확인
+    # [1단계] 전원 레일 활성화 확인
     power_active = any(p[1] < h * 0.45 for p in pins)
     if not power_active:
          for b in clean_bodies:
             if 'wire' in b['name'] and b['center'][1] < h * 0.45:
                 power_active = True; break
     
-    # 연결 확인
+    # [2단계] 연결 상태 판단 (전파 로직)
     if power_active:
         # 직접 연결
         for comp in clean_bodies:
             cy = comp['center'][1]
-            if cy < h*0.48 or cy > h*0.52: comp['is_on'] = True
+            if cy < h*0.48 or cy > h*0.52: 
+                comp['is_on'] = True
 
-        # 전파 (Propagation)
+        # 간접 연결 (Propagation 2회)
         for _ in range(2): 
             for comp in clean_bodies:
                 if comp['is_on']: continue 
                 cx, cy = comp['center']
+                
+                # 다른 켜진 부품 근처
                 for other in clean_bodies:
                     if not other['is_on']: continue
                     ocx, ocy = other['center']
@@ -153,6 +155,7 @@ def analyze_real(img, model):
                     if dist < CONNECTION_THRESHOLD:
                         comp['is_on'] = True; break
                 
+                # 전원 핀 근처
                 if not comp['is_on']:
                     for px, py in pins:
                         if math.sqrt((cx-px)**2 + (cy-py)**2) < CONNECTION_THRESHOLD:
@@ -161,13 +164,15 @@ def analyze_real(img, model):
 
     off_count = 0
     
+    # [3단계] 시각화
     for comp in clean_bodies:
         is_on = comp['is_on']
+        
         if is_on:
-            color = (0, 255, 0) # ON
+            color = (0, 255, 0) # 초록 (ON)
             status = "ON"
         else:
-            color = (0, 0, 255) # OFF
+            color = (0, 0, 255) # 빨강 (OFF)
             status = "OFF"
             off_count += 1
         
@@ -178,10 +183,10 @@ def analyze_real(img, model):
     return img, {'off': off_count, 'total': len(clean_bodies), 'details': {}}
 
 # ==========================================
-# [5. 메인 UI]
+# [5. 메인 UI (Streamlit)]
 # ==========================================
-st.title("🧠 BrainBoard V5: Final Fix")
-st.markdown("### 회로도 중복 인식 문제 해결됨")
+st.title("🧠 BrainBoard V5: Circuit Check")
+st.markdown("### 회로도 vs 실물 연결 상태(ON/OFF) 확인")
 
 @st.cache_resource
 def load_models():
@@ -213,7 +218,7 @@ if ref_file and tgt_file:
             st.divider()
             
             # 결과 이미지 출력
-            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (깔끔하게 보정됨)", use_column_width=True)
+            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석", use_column_width=True)
             st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 분석 (OFF 개수: {tgt_data['off']})", use_column_width=True)
             
             if tgt_data['off'] == 0:
