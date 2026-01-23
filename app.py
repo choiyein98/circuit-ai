@@ -1,14 +1,15 @@
+import streamlit as st
 import cv2
 import numpy as np
 from ultralytics import YOLO
-import sys
 import math
-import tkinter as tk
-from tkinter import filedialog
+from PIL import Image
 
 # ==========================================
 # [설정 및 상수]
 # ==========================================
+st.set_page_config(page_title="BrainBoard V44", layout="wide")
+
 MODEL_REAL_PATH = 'best.pt'    # 실물 보드용 모델
 MODEL_SYM_PATH = 'symbol.pt'   # 회로도용 모델
 PIN_SENSITIVITY = 140          # 핀과 부품 간 연결 감지 범위 (픽셀 단위)
@@ -21,13 +22,11 @@ def solve_overlap(parts, dist_thresh=60):
     중복 감지된 객체들을 거리 기준으로 필터링 (Conf 높은 것 우선)
     """
     if not parts: return []
-    # conf(신뢰도)가 높은 순서대로 정렬
     if 'conf' in parts[0]:
         parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
     final = []
     for curr in parts:
-        # 이미 등록된 부품들과 너무 가까우면(중복이면) 건너뜀
         if not any(math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2) < dist_thresh for k in final):
             final.append(curr)
     return final
@@ -35,9 +34,8 @@ def solve_overlap(parts, dist_thresh=60):
 # ==========================================
 # [분석 함수 1: 회로도 (Schematic)]
 # ==========================================
-def analyze_schematic(img_path, model):
-    img = cv2.imread(img_path)
-    if img is None: return None
+def analyze_schematic(img, model):
+    # Streamlit에서는 이미지를 numpy array로 바로 받으므로 imread 삭제
     
     # 모델 추론
     res = model.predict(source=img, conf=0.15, verbose=False)
@@ -55,7 +53,6 @@ def analyze_schematic(img_path, model):
     
     for p in clean:
         name = p['name']
-        # 가장 왼쪽 부품을 전원(Source)으로 강제 지정 (회로도 특성상)
         if p['center'][0] < img.shape[1] * 0.25: name = 'source'
         elif 'cap' in name: name = 'capacitor'
         elif 'res' in name: name = 'resistor'
@@ -68,16 +65,15 @@ def analyze_schematic(img_path, model):
 # ==========================================
 # [분석 함수 2: 실물 (Real Board)]
 # ==========================================
-def analyze_real(img_path, model):
-    img = cv2.imread(img_path)
-    if img is None: return None, 0
+def analyze_real(img, model):
+    # Streamlit에서는 이미지를 numpy array로 바로 받으므로 imread 삭제
     h, w, _ = img.shape
     
     # 모델 추론
     res = model.predict(source=img, conf=0.1, verbose=False)
     
-    bodies = [] # 시각화할 부품 (몸체 + 와이어)
-    pins = []   # 연결 확인용 핀 (다리) - 화면엔 안 그림
+    bodies = [] 
+    pins = []   
     
     for b in res[0].boxes:
         name = model.names[int(b.cls[0])].lower()
@@ -85,28 +81,19 @@ def analyze_real(img_path, model):
         center = ((coords[0]+coords[2])/2, (coords[1]+coords[3])/2)
         conf = float(b.conf[0])
         
-        # [수정된 핵심 로직] 
-        # 'wire'는 핀 리스트에서 제외하고 bodies(시각화 대상)로 분류
-        
-        # 1. 핀/다리(Leg) 처리 -> 화면에 안 그리고 좌표 계산용으로만 사용
+        # [Wire 및 Pin 분류 로직]
         if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
             pins.append(center)
-        
-        # 2. 브레드보드 배경 제외
         elif 'breadboard' in name:
             continue
-            
-        # 3. 그 외 부품 (저항, 커패시터, 그리고 WIRE 포함) -> 화면에 그림
         else:
             bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf})
 
     clean_bodies = solve_overlap(bodies, 60)
     
     # [전원 활성화 로직]
-    # 1. 핀이 상단 전원 레일(높이의 45% 지점 위쪽)에 있는지 확인
     power_active = any(p[1] < h * 0.45 for p in pins)
     
-    # 2. 핀이 감지되지 않았더라도, 'wire'가 상단 전원부에 있다면 전원 ON으로 간주
     if not power_active:
         for b in clean_bodies:
             if 'wire' in b['name'] and b['center'][1] < h * 0.45:
@@ -120,22 +107,17 @@ def analyze_real(img_path, model):
         name = comp['name']
         is_on = False
         
-        # 와이어는 연결선이므로 주황색으로 표시하고 항상 활성 상태로 간주
         if 'wire' in name:
-            color = (0, 165, 255) # 주황색 (BGR 순서: Blue=0, Green=165, Red=255)
+            color = (0, 165, 255) # 주황색 (OpenCV는 BGR)
             status = "WIRE"
-            is_on = True # 와이어는 OFF 카운트에서 제외
+            is_on = True 
         else:
-            # 일반 부품 로직
             if power_active:
-                # A. 부품 자체가 전원 레일 근처(중앙 분리대 위/아래)에 위치
                 if cy < h*0.48 or cy > h*0.52: 
                     is_on = True
                 else:
-                    # B. 부품 근처에 핀이 있고, 그 핀이 전원 쪽에 연결되어 있는지 확인
                     for px, py in pins:
                         if math.sqrt((cx-px)**2 + (cy-py)**2) < PIN_SENSITIVITY:
-                            # 핀의 y좌표가 중앙 영역을 벗어나 있으면(전원 레일 쪽) ON
                             if py < h*0.48 or py > h*0.52:
                                 is_on = True; break
             
@@ -147,7 +129,6 @@ def analyze_real(img_path, model):
                 status = "OFF"
                 off_count += 1
         
-        # 결과 그리기
         x1, y1, x2, y2 = map(int, comp['box'])
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
         cv2.putText(img, status, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
@@ -155,58 +136,48 @@ def analyze_real(img_path, model):
     return img, off_count
 
 # ==========================================
-# [Main Execution]
+# [WEB APP UI] Streamlit Main Code
 # ==========================================
-if __name__ == "__main__":
-    try:
-        # 윈도우 파일 탐색기 초기화
-        root = tk.Tk()
-        root.withdraw()
-        
-        print("--- BrainBoard V44 실행 ---")
-        
-        print("1. PSpice 회로도 이미지를 선택하세요...")
-        p1 = filedialog.askopenfilename(title="1. PSpice 회로도 선택", filetypes=[("Images", "*.jpg;*.png;*.jpeg")])
-        if not p1: 
-            print("회로도 선택이 취소되었습니다.")
-            sys.exit()
-        
-        print("2. 실물 회로(브레드보드) 이미지를 선택하세요...")
-        p2 = filedialog.askopenfilename(title="2. 실물 사진 선택", filetypes=[("Images", "*.jpg;*.png;*.jpeg")])
-        if not p2: 
-            print("실물 사진 선택이 취소되었습니다.")
-            sys.exit()
+st.title("🧠 BrainBoard V44: AI Circuit Verifier")
+st.markdown("### PSpice 회로도와 실제 브레드보드 사진을 업로드하세요.")
 
-        print("분석 모델을 로드하고 있습니다...")
-        m_real = YOLO(MODEL_REAL_PATH)
-        m_sym = YOLO(MODEL_SYM_PATH)
+@st.cache_resource
+def load_models():
+    return YOLO(MODEL_REAL_PATH), YOLO(MODEL_SYM_PATH)
 
-        print("이미지 분석 중...")
-        res1 = analyze_schematic(p1, m_sym)
-        res2, off = analyze_real(p2, m_real)
+try:
+    model_real, model_sym = load_models()
+    st.sidebar.success("✅ AI 모델 로드 완료!")
+except Exception as e:
+    st.error(f"모델 파일을 찾을 수 없습니다: {e}")
+    st.stop()
 
-        # 결과 이미지 병합 (가로로 이어붙이기)
-        if res1 is not None and res2 is not None:
-            h1, w1 = res1.shape[:2]
-            h2, w2 = res2.shape[:2]
-            max_h = max(h1, h2)
+col1, col2 = st.columns(2)
+ref_file = col1.file_uploader("1. 회로도(Schematic) 업로드", type=['jpg', 'png', 'jpeg'])
+tgt_file = col2.file_uploader("2. 실물(Real Board) 업로드", type=['jpg', 'png', 'jpeg'])
+
+if ref_file and tgt_file:
+    # 파일 업로더 객체를 OpenCV 이미지로 변환
+    ref_image = Image.open(ref_file)
+    tgt_image = Image.open(tgt_file)
+    ref_cv = cv2.cvtColor(np.array(ref_image), cv2.COLOR_RGB2BGR)
+    tgt_cv = cv2.cvtColor(np.array(tgt_image), cv2.COLOR_RGB2BGR)
+
+    if st.button("🚀 회로 검증 시작 (Analyze)"):
+        with st.spinner("AI가 회로를 분석 중입니다..."):
+            # 이미지 경로 대신 이미지 배열 자체를 전달
+            res_ref_img = analyze_schematic(ref_cv.copy(), model_sym)
+            res_tgt_img, off_count = analyze_real(tgt_cv.copy(), model_real)
+
+            st.divider()
             
-            canvas = np.zeros((max_h, w1 + w2, 3), dtype=np.uint8)
-            canvas[:h1, :w1] = res1
-            canvas[:h2, w1:w1+w2] = res2
+            # 결과 텍스트 출력
+            if off_count == 0:
+                st.success("🎉 Perfect! 모든 부품이 정상적으로 연결되었습니다.")
+            else:
+                st.error(f"❌ 오류 발견: {off_count}개의 부품이 연결되지 않았거나(OFF) 비정상입니다.")
+                st.warning("팁: 전원 연결 상태와 핀이 브레드보드에 깊게 꽂혔는지 확인하세요.")
 
-            # 화면 크기에 맞춰 리사이징 (폭 1400px 넘으면 축소)
-            if canvas.shape[1] > 1400:
-                scale = 1400 / canvas.shape[1]
-                canvas = cv2.resize(canvas, None, fx=scale, fy=scale)
-
-            print(f"분석 완료! 발견된 비정상(OFF) 부품 수: {off}")
-            cv2.imshow("BrainBoard Verification", canvas)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
-            
-    except Exception as e:
-        print(f"오류가 발생했습니다: {e}")
-        import traceback
-        traceback.print_exc()
-        input("엔터를 누르면 종료합니다...")
+            # 결과 이미지 출력
+            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="PSpice 회로도 분석", use_container_width=True)
+            st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 보드 분석 (비정상 부품: {off_count})", use_container_width=True)
