@@ -8,16 +8,16 @@ from PIL import Image
 # ==========================================
 # [1. 설정 및 라이브러리]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V10 (Wire Fix)", layout="wide")
+st.set_page_config(page_title="BrainBoard V11 (Tournament Logic)", layout="wide")
 
-MODEL_REAL_PATH = 'best.pt'      # 실물 모델
-MODEL_SYM_PATH = 'symbol.pt'     # 회로도 모델
+MODEL_REAL_PATH = 'best.pt'
+MODEL_SYM_PATH = 'symbol.pt'
 
-# 연결 감지 범위 (몸통에서 다리가 뻗어나가는 범위)
+# 연결 감지 범위
 LEG_EXTENSION_RANGE = 180        
 
 # ==========================================
-# [2. 유틸리티 함수]
+# [2. 유틸리티 함수: 강력한 토너먼트 로직]
 # ==========================================
 def calculate_iou(box1, box2):
     x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
@@ -29,21 +29,24 @@ def calculate_iou(box1, box2):
 
 def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4):
     """
-    강력한 중복 제거 (토너먼트 방식)
+    [토너먼트 로직]
+    1. 점수(conf)가 높은 순서대로 줄을 세웁니다. (Winner 후보)
+    2. 1등부터 차례대로 내려가면서, 자신과 겹치는 하위권 박스들을 모두 제거합니다.
     """
     if not parts: return []
+    # 1. 신뢰도 기준 내림차순 정렬 (점수 높은게 0번 인덱스)
     parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
     final = []
     for curr in parts:
         is_dup = False
         for k in final:
-            # 1. 면적 겹침 (IoU)
+            # 2-1. 면적 겹침 (IoU) 체크
             iou = calculate_iou(curr['box'], k['box'])
             if iou > iou_thresh:
                 is_dup = True; break
             
-            # 2. 포함 관계 (큰 박스 안에 작은 박스)
+            # 2-2. 포함 관계 (큰 박스 안에 작은 박스) 체크
             x1 = max(curr['box'][0], k['box'][0])
             y1 = max(curr['box'][1], k['box'][1])
             x2 = min(curr['box'][2], k['box'][2])
@@ -51,10 +54,11 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4):
             inter_area = max(0, x2-x1) * max(0, y2-y1)
             curr_area = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
             
+            # 70% 이상 먹혔으면 제거
             if curr_area > 0 and (inter_area / curr_area) > 0.7:
                 is_dup = True; break
 
-            # 3. 거리
+            # 2-3. 거리 체크
             if dist_thresh > 0:
                 dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
                 if dist < dist_thresh:
@@ -68,11 +72,12 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석 (기존 성공 로직 유지)]
+# [3. 회로도 분석: 그물망 수법]
 # ==========================================
 def analyze_schematic(img, model):
-    # 회로도는 0.10으로 낮게 잡아서 다 찾아냄
-    res = model.predict(source=img, conf=0.10, verbose=False)
+    # [전략] 인식률 0.01 (1%) -> 일단 눈에 보이는 건 다 잡습니다.
+    # 그 후 토너먼트 로직으로 정리합니다. 이렇게 해야 놓치는 부품이 없습니다.
+    res = model.predict(source=img, conf=0.01, verbose=False)
     
     raw = []
     for b in res[0].boxes:
@@ -87,9 +92,10 @@ def analyze_schematic(img, model):
             'conf': conf
         })
     
-    clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.2)
+    # [토너먼트] 겹침 허용치 0.1 (조금만 겹쳐도 점수 높은 놈이 이김)
+    clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1)
     
-    # [강제 보정] 가장 왼쪽 = 전원 (Source)
+    # [강제 보정] 왼쪽 = Source
     leftmost_idx = -1
     min_x = float('inf')
     if clean:
@@ -126,12 +132,12 @@ def analyze_schematic(img, model):
     return img, {'total': len(clean), 'details': summary_details}
 
 # ==========================================
-# [4. 실물 분석 (와이어 인식 강화)]
+# [4. 실물 분석: 엄격한 관리자 모드]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
     
-    # 1. 기본 스캔 (낮게 시작)
+    # 1. 기본 스캔 (0.1로 시작하되 내부에서 엄격하게 컷)
     res = model.predict(source=img, conf=0.10, verbose=False)
     
     bodies = []
@@ -143,26 +149,21 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # [핵심 수정 1] 부품별 인식 기준 (Dynamic Threshold)
-        if 'cap' in name:
-            min_conf = 0.45   # 커패시터: 엄격
-        elif 'res' in name:
-            min_conf = 0.35   # 저항: 적당히 엄격
-        elif 'wire' in name:
-            min_conf = 0.15   # [NEW] 와이어: 낮게 잡아서 인식률 높임
-        else:
-            min_conf = 0.25
+        # [핵심] 부품별 커트라인 (Threshold)
+        # 저항이 자꾸 3개로 잡히는 문제 해결 -> 0.40으로 대폭 상향
+        if 'cap' in name: min_conf = 0.45      # 커패시터: 매우 엄격
+        elif 'res' in name: min_conf = 0.40    # 저항: 엄격 (그림자/와이어 방지)
+        elif 'wire' in name: min_conf = 0.15   # 와이어: 관대함
+        else: min_conf = 0.25
             
         if conf < min_conf: continue
 
-        # [핵심 수정 2] 와이어를 'bodies'에 포함시킴 (기존엔 pins로 뺐었음)
-        # 이제 와이어도 박스가 쳐지고 ON/OFF 로직에 참여함
+        # 와이어도 Body로 취급 (연결/시각화용)
         if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
             pins.append({'center': center, 'box': coords})
         elif 'breadboard' in name:
             continue
         else:
-            # 저항, 커패시터, **와이어** 포함
             bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
     # 중복 제거
@@ -171,39 +172,31 @@ def analyze_real(img, model):
     # ----------------------------------------------------
     # [연결 로직]
     # ----------------------------------------------------
-    
-    # 1. 전원 공급원 찾기 (상단 45%)
     power_active = False
-    
-    # 핀이나 와이어가 상단에 있으면 전원 ON
     for b in clean_bodies:
         if 'wire' in b['name'] and b['center'][1] < h * 0.45:
             power_active = True; break
-            
     if not power_active:
         for p in pins:
             if p['center'][1] < h * 0.45:
                 power_active = True; break
 
-    # 2. 연결 상태 전파
     if power_active:
-        # (1) 직접 연결: 상단/하단 레일 영역
+        # (1) 직접 연결
         for comp in clean_bodies:
             cy = comp['center'][1]
             if cy < h*0.48 or cy > h*0.52: 
                 comp['is_on'] = True
 
-        # (2) 간접 연결 (3회 반복 - 멀리 퍼지도록)
+        # (2) 간접 연결 (3회 전파)
         for _ in range(3): 
             for comp in clean_bodies:
                 if comp['is_on']: continue 
-                
                 cx, cy = comp['center']
                 
-                # A. 핀(다리)과 가까운가?
+                # A. 핀(다리)
                 for p in pins:
                     px, py = p['center']
-                    # 핀이 상단/하단 전원부에 있거나
                     if py < h*0.48 or py > h*0.52:
                          dist = math.sqrt((cx - px)**2 + (cy - py)**2)
                          if dist < LEG_EXTENSION_RANGE:
@@ -211,12 +204,11 @@ def analyze_real(img, model):
 
                 if comp['is_on']: continue
 
-                # B. 이미 켜진 다른 부품(와이어 포함)과 가까운가?
+                # B. 다른 부품
                 for other in clean_bodies:
                     if not other['is_on']: continue
                     ocx, ocy = other['center']
                     dist = math.sqrt((cx - ocx)**2 + (cy - ocy)**2)
-                    
                     if dist < LEG_EXTENSION_RANGE * 1.5:
                         comp['is_on'] = True; break
 
@@ -227,12 +219,11 @@ def analyze_real(img, model):
         is_on = comp['is_on']
         raw_name = comp['name']
         
-        # 카운팅용 이름 정규화
+        # 카운팅용 이름 (와이어 제외)
         norm_name = raw_name
         if 'res' in raw_name: norm_name = 'resistor'
         elif 'cap' in raw_name: norm_name = 'capacitor'
         
-        # 와이어는 개수 비교에서는 제외 (하지만 화면엔 표시됨)
         if 'wire' not in raw_name:
             real_details[norm_name] = real_details.get(norm_name, 0) + 1
 
@@ -253,8 +244,8 @@ def analyze_real(img, model):
 # ==========================================
 # [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V10 (Wire Fix)")
-st.markdown("### 1. 부품 일치 여부 (와이어 인식 추가)")
+st.title("🧠 BrainBoard V11 (Tournament Logic)")
+st.markdown("### 1. 부품 일치 여부 (토너먼트 선별)")
 st.markdown("### 2. 연결 상태 확인")
 
 @st.cache_resource
@@ -286,25 +277,26 @@ if ref_file and tgt_file:
 
             st.divider()
             
-            # 불일치 검사
+            # [핵심] 불일치 검사 및 메시지 생성
             mismatch_errors = []
-            target_parts = ['resistor', 'capacitor']
+            target_parts = ['resistor', 'capacitor', 'inductor'] # 검사 대상 추가
             
             for part in target_parts:
                 ref_cnt = ref_data['details'].get(part, 0)
                 tgt_cnt = tgt_data['details'].get(part, 0)
                 
+                # 하나라도 다르면 에러 메시지 추가
                 if ref_cnt != tgt_cnt:
                     mismatch_errors.append(f"⚠️ {part.upper()} 불일치: 회로도 {ref_cnt}개 vs 실물 {tgt_cnt}개")
             
             # 이미지 출력
-            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석", use_column_width=True)
+            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (1% 탐지 + 토너먼트)", use_column_width=True)
             st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 분석 (OFF: {tgt_data['off']})", use_column_width=True)
             
             if mismatch_errors:
                 st.error("❌ 회로 구성이 다릅니다 (부품 개수 불일치)")
                 for err in mismatch_errors:
-                    st.write(err)
+                    st.write(err) # 여기서 커패시터 불일치도 뜹니다.
             elif tgt_data['off'] > 0:
                 st.error(f"❌ 부품 연결이 끊어졌습니다 ({tgt_data['off']}개 OFF)")
             else:
