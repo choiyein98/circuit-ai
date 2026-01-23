@@ -8,7 +8,7 @@ from PIL import Image
 # ==========================================
 # [1. 설정 및 라이브러리]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V12 (Capacitor Fix)", layout="wide")
+st.set_page_config(page_title="BrainBoard V13 (Resistor Strict / Cap Loose)", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'
 MODEL_SYM_PATH = 'symbol.pt'
@@ -29,7 +29,7 @@ def calculate_iou(box1, box2):
 
 def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4):
     """
-    [토너먼트 로직] 점수 높은 박스가 겹치는 하위 박스를 제거
+    [토너먼트 로직] 점수(conf) 높은 박스가 겹치는 하위 박스를 제거
     """
     if not parts: return []
     parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
@@ -43,7 +43,7 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4):
             if iou > iou_thresh:
                 is_dup = True; break
             
-            # 2. 포함 관계
+            # 2. 포함 관계 (큰 박스 안에 작은 박스)
             x1 = max(curr['box'][0], k['box'][0])
             y1 = max(curr['box'][1], k['box'][1])
             x2 = min(curr['box'][2], k['box'][2])
@@ -123,7 +123,7 @@ def analyze_schematic(img, model):
     return img, {'total': len(clean), 'details': summary_details}
 
 # ==========================================
-# [4. 실물 분석: 커패시터 구출 작전]
+# [4. 실물 분석: 저항은 엄격하게, 커패시터는 관대하게]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
@@ -139,10 +139,10 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # [핵심 수정] 커패시터 기준 대폭 완화
-        if 'cap' in name: min_conf = 0.15      # [Fix] 0.45 -> 0.15 (무조건 잡게)
-        elif 'res' in name: min_conf = 0.40    # 저항은 여전히 엄격 (0.40)
-        elif 'wire' in name: min_conf = 0.15   # 와이어는 관대하게
+        # [핵심 수정] 밸런스 패치
+        if 'cap' in name: min_conf = 0.10      # [DOWN] 0.15 -> 0.10 (무조건 잡아!)
+        elif 'res' in name: min_conf = 0.50    # [UP] 0.40 -> 0.50 (가짜 저항 컷!)
+        elif 'wire' in name: min_conf = 0.15   # 와이어: 관대하게
         else: min_conf = 0.25
             
         if conf < min_conf: continue
@@ -176,7 +176,7 @@ def analyze_real(img, model):
             if cy < h*0.48 or cy > h*0.52: 
                 comp['is_on'] = True
 
-        # (2) 간접 연결 (3회 전파)
+        # (2) 간접 연결
         for _ in range(3): 
             for comp in clean_bodies:
                 if comp['is_on']: continue 
@@ -208,8 +208,9 @@ def analyze_real(img, model):
         raw_name = comp['name']
         
         norm_name = raw_name
-        label_name = "" # 화면 표시용
+        label_name = "" 
         
+        # [문구 표시 강화]
         if 'res' in raw_name: 
             norm_name = 'resistor'; label_name = "RES"
         elif 'cap' in raw_name: 
@@ -230,7 +231,7 @@ def analyze_real(img, model):
             status = "OFF"
             off_count += 1
         
-        # [수정] 박스 위에 "이름: ON" 형태로 표시
+        # 박스 위에 "CAP: ON" 같이 표시
         display_text = f"{label_name}: {status}"
         
         x1, y1, x2, y2 = map(int, comp['box'])
@@ -242,9 +243,9 @@ def analyze_real(img, model):
 # ==========================================
 # [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V12 (Capacitor Fix)")
-st.markdown("### 1. 부품 일치 여부")
-st.markdown("### 2. 연결 상태 (이름 표시)")
+st.title("🧠 BrainBoard V13 (Resistor Strict / Cap Loose)")
+st.markdown("### 1. 부품 일치 여부 확인")
+st.markdown("### 2. 연결 상태 (이름+상태 표시)")
 
 @st.cache_resource
 def load_models():
@@ -275,7 +276,7 @@ if ref_file and tgt_file:
 
             st.divider()
             
-            # 불일치 검사 (커패시터 포함)
+            # 불일치 검사
             mismatch_errors = []
             target_parts = ['resistor', 'capacitor', 'inductor'] 
             
