@@ -8,14 +8,16 @@ from PIL import Image
 # ==========================================
 # [1. 설정 및 라이브러리]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V17 (Universal Tuner)", layout="wide")
+st.set_page_config(page_title="BrainBoard V18 (Auto-Merge)", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'
 MODEL_SYM_PATH = 'symbol.pt'
+
+# 연결 감지 범위
 LEG_EXTENSION_RANGE = 180        
 
 # ==========================================
-# [2. 유틸리티 함수: 이원화된 중복 제거]
+# [2. 유틸리티 함수: 스마트 중복 제거]
 # ==========================================
 def calculate_iou(box1, box2):
     x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
@@ -27,8 +29,9 @@ def calculate_iou(box1, box2):
 
 def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4, is_schematic=False):
     """
-    is_schematic=True: 회로도용 (공격적 통합)
-    is_schematic=False: 실물용 (정교한 분리)
+    [핵심] is_schematic=True일 때:
+    회로도에서 긴 저항 기호가 끊겨서 인식될 때, 
+    같은 종류끼리 가까이 있으면 무조건 하나로 합쳐버립니다.
     """
     if not parts: return []
     parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
@@ -37,34 +40,41 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4, is_schematic=False):
     for curr in parts:
         is_dup = False
         for k in final:
-            # 1. IoU 계산
+            # 1. 기본 계산
             iou = calculate_iou(curr['box'], k['box'])
             
-            # 2. 포함 관계 계산 (작은 박스가 큰 박스에 먹혔나?)
             x1 = max(curr['box'][0], k['box'][0])
             y1 = max(curr['box'][1], k['box'][1])
             x2 = min(curr['box'][2], k['box'][2])
             y2 = min(curr['box'][3], k['box'][3])
-            
             inter_area = max(0, x2-x1) * max(0, y2-y1)
             area_curr = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
             area_k = (k['box'][2]-k['box'][0]) * (k['box'][3]-k['box'][1])
             min_area = min(area_curr, area_k)
 
-            # [모드별 분기]
+            # -----------------------------------------------------------
+            # [MODE A] 회로도 전용 (저항 쪼개짐 방지)
+            # -----------------------------------------------------------
             if is_schematic:
-                # 회로도: 같은 부품끼리는 조금만 겹쳐도(1%) 합체 (끊긴 선 방지)
+                # 이름이 같고(예: resistor == resistor)
                 if curr['name'] == k['name']:
-                    if iou > 0.01: is_dup = True; break
-                    # 거리 가까우면 합체
-                    dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
-                    if dist < 50: is_dup = True; break
-                else:
-                    # 다른 부품은 80% 이상 먹혔을 때만 제거
-                    if min_area > 0 and (inter_area / min_area) > 0.8:
+                    # 아주 조금이라도 겹치거나 (1%)
+                    if iou > 0.01: 
                         is_dup = True; break
+                    
+                    # 거리가 가까우면 (60px 이내) -> 하나의 부품으로 간주!
+                    dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
+                    if dist < 60:
+                        is_dup = True; break
+                
+                # 이름이 달라도 포함되어 있으면 제거
+                if min_area > 0 and (inter_area / min_area) > 0.8:
+                    is_dup = True; break
+            
+            # -----------------------------------------------------------
+            # [MODE B] 실물 전용 (V15의 정교한 로직 유지)
+            # -----------------------------------------------------------
             else:
-                # 실물: 일반적인 IoU 기준 적용
                 if iou > iou_thresh: is_dup = True; break
                 if min_area > 0 and (inter_area / min_area) > 0.8: is_dup = True; break
                 if dist_thresh > 0:
@@ -79,11 +89,11 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석 (범용성 강화)]
+# [3. 회로도 분석 (자동 합치기 적용)]
 # ==========================================
-def analyze_schematic(img, model, conf_thresh):
-    # 사용자가 설정한 슬라이더 값(conf_thresh)을 적용
-    res = model.predict(source=img, conf=conf_thresh, verbose=False)
+def analyze_schematic(img, model):
+    # 회로도는 1%라도 감지되면 일단 다 가져옴 (놓침 방지)
+    res = model.predict(source=img, conf=0.01, verbose=False)
     
     raw = []
     for b in res[0].boxes:
@@ -98,16 +108,16 @@ def analyze_schematic(img, model, conf_thresh):
             'conf': conf
         })
     
-    # 회로도 전용 중복 제거
+    # [핵심] is_schematic=True 설정 -> 쪼개진 저항 합체!
     clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1, is_schematic=True)
     
-    # [수정] "무조건 왼쪽이 전원" 로직 삭제 -> AI 인식명 우선 (오류 감소)
-    # 대신 전원이 하나도 없으면 가장 왼쪽 것을 전원으로 추측
-    has_source = any(p['name'] in ['source', 'volt', 'batt'] for p in clean)
+    # 전원 위치 보정 (왼쪽 우선)
     leftmost_idx = -1
+    min_x = float('inf')
     
+    # 전원이 없으면 가장 왼쪽 부품을 전원으로
+    has_source = any(p['name'] in ['source', 'volt', 'batt'] for p in clean)
     if not has_source and clean:
-        min_x = float('inf')
         for i, p in enumerate(clean):
             if p['center'][0] < min_x:
                 min_x = p['center'][0]
@@ -119,14 +129,12 @@ def analyze_schematic(img, model, conf_thresh):
         raw_name = p['name']
         name = raw_name 
         
-        # 이름 정규화
         if 'cap' in raw_name: name = 'capacitor'
         elif 'res' in raw_name: name = 'resistor'
         elif 'ind' in raw_name: name = 'inductor'
         elif 'dio' in raw_name: name = 'diode'
         elif any(x in raw_name for x in ['volt', 'batt', 'source']): name = 'source'
 
-        # 전원이 없을 때만 위치 기반 추측 사용
         if i == leftmost_idx:
             name = 'source'
         
@@ -141,12 +149,11 @@ def analyze_schematic(img, model, conf_thresh):
     return img, {'total': len(clean), 'details': summary_details}
 
 # ==========================================
-# [4. 실물 분석 (사용자 튜닝)]
+# [4. 실물 분석 (V15 설정 고정)]
 # ==========================================
-def analyze_real(img, model, conf_res, conf_cap, conf_wire):
+def analyze_real(img, model):
     h, w, _ = img.shape
     
-    # 기본 스캔은 낮게 시작 (내부에서 필터링)
     res = model.predict(source=img, conf=0.10, verbose=False)
     
     bodies = []
@@ -158,10 +165,10 @@ def analyze_real(img, model, conf_res, conf_cap, conf_wire):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # [핵심] 사용자가 슬라이더로 조절한 값을 적용
-        if 'cap' in name: min_conf = conf_cap
-        elif 'res' in name: min_conf = conf_res
-        elif 'wire' in name: min_conf = conf_wire
+        # [V15 민감도 고정] 사용자님이 "딱 좋다"고 하신 그 설정
+        if 'cap' in name: min_conf = 0.15      # 커패시터: 잘 잡게 낮춤
+        elif 'res' in name: min_conf = 0.60    # 저항: 엄격하게 높임 (가짜 방지)
+        elif 'wire' in name: min_conf = 0.15   # 와이어: 잘 잡게 낮춤
         else: min_conf = 0.25
             
         if conf < min_conf: continue
@@ -173,7 +180,7 @@ def analyze_real(img, model, conf_res, conf_cap, conf_wire):
         else:
             bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
-    # 실물 전용 중복 제거
+    # 실물 중복 제거 (is_schematic=False)
     clean_bodies = solve_overlap(bodies, dist_thresh=60, iou_thresh=0.3, is_schematic=False)
     
     # [연결 로직]
@@ -251,10 +258,11 @@ def analyze_real(img, model, conf_res, conf_cap, conf_wire):
     return img, {'off': off_count, 'total': len(clean_bodies), 'details': real_details}
 
 # ==========================================
-# [5. 메인 UI (튜너 추가)]
+# [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V17: Universal Tuner")
-st.markdown("### 민감도를 직접 조절하여 모든 회로에 대응하세요.")
+st.title("🧠 BrainBoard V18 (Auto-Merge)")
+st.markdown("### 1. 부품 일치 여부")
+st.markdown("### 2. 연결 상태")
 
 @st.cache_resource
 def load_models():
@@ -267,24 +275,6 @@ except Exception as e:
     st.error(f"모델 로드 실패: {e}")
     st.stop()
 
-# ------------------------------------------------------------------
-# [SIDEBAR] 민감도 조절 슬라이더 (사용자가 직접 튜닝!)
-# ------------------------------------------------------------------
-st.sidebar.header("🎛️ 분석 민감도 설정")
-st.sidebar.info("부품이 안 잡히면 낮추고, 엉뚱한게 잡히면 높이세요.")
-
-# 회로도 설정
-st.sidebar.markdown("---")
-st.sidebar.subheader("📄 회로도 설정")
-conf_sym = st.sidebar.slider("회로도 인식 민감도", 0.0, 1.0, 0.20, 0.05)
-
-# 실물 설정
-st.sidebar.markdown("---")
-st.sidebar.subheader("📸 실물 설정")
-conf_res = st.sidebar.slider("저항(Resistor) 민감도", 0.0, 1.0, 0.40, 0.05)
-conf_cap = st.sidebar.slider("커패시터(Capacitor) 민감도", 0.0, 1.0, 0.20, 0.05)
-conf_wire = st.sidebar.slider("와이어(Wire) 민감도", 0.0, 1.0, 0.15, 0.05)
-
 col1, col2 = st.columns(2)
 ref_file = col1.file_uploader("1. 회로도 업로드", type=['jpg', 'png', 'jpeg'])
 tgt_file = col2.file_uploader("2. 실물 사진 업로드", type=['jpg', 'png', 'jpeg'])
@@ -296,11 +286,10 @@ if ref_file and tgt_file:
     ref_cv = cv2.cvtColor(np.array(ref_image), cv2.COLOR_RGB2BGR)
     tgt_cv = cv2.cvtColor(np.array(tgt_image), cv2.COLOR_RGB2BGR)
 
-    # 버튼 누를 때 슬라이더 값을 함수로 전달
     if st.button("🚀 정밀 분석 실행"):
-        with st.spinner("사용자 설정 적용 중..."):
-            res_ref_img, ref_data = analyze_schematic(ref_cv.copy(), model_sym, conf_sym)
-            res_tgt_img, tgt_data = analyze_real(tgt_cv.copy(), model_real, conf_res, conf_cap, conf_wire)
+        with st.spinner("AI 분석 중..."):
+            res_ref_img, ref_data = analyze_schematic(ref_cv.copy(), model_sym)
+            res_tgt_img, tgt_data = analyze_real(tgt_cv.copy(), model_real)
 
             st.divider()
             
@@ -322,7 +311,7 @@ if ref_file and tgt_file:
             if c_ref != c_tgt:
                 mismatch_errors.append(f"⚠️ CAPACITOR 불일치: 회로도 {c_ref}개 vs 실물 {c_tgt}개")
             
-            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 결과", use_column_width=True)
+            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (자동 통합 적용)", use_column_width=True)
             st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 분석 (OFF: {tgt_data['off']})", use_column_width=True)
             
             if mismatch_errors:
