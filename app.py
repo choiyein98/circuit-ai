@@ -12,16 +12,27 @@ st.set_page_config(page_title="BrainBoard V5 Final", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'      # 실물 브레드보드 분석용
 MODEL_SYM_PATH = 'symbol.pt'     # 회로도 기호 분석용
-PIN_SENSITIVITY = 140            # 핀과 부품 간의 거리 허용 오차 (픽셀)
+# 연결 감지 거리 (픽셀) - 와이어와 부품이 이 거리 안에 있으면 연결된 것으로 간주
+CONNECTION_THRESHOLD = 100       
 
 # ==========================================
-# [2. 중복 제거 함수]
+# [2. 유틸리티 함수 (중복 제거 및 좌표 계산)]
 # ==========================================
-def solve_overlap(parts, dist_thresh=30):
+def calculate_iou(box1, box2):
+    """두 박스의 겹치는 비율(IoU) 계산"""
+    x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - inter
+    return inter / union if union > 0 else 0
+
+def solve_overlap(parts, dist_thresh=30, iou_thresh=0.3):
     """
-    기능: 겹치는 박스들을 정리
+    기능: 겹치는 박스들을 정리 (거리 + IoU 기준)
     """
     if not parts: return []
+    # 신뢰도 높은 순 정렬
     if 'conf' in parts[0]:
         parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
@@ -29,8 +40,13 @@ def solve_overlap(parts, dist_thresh=30):
     for curr in parts:
         is_dup = False
         for k in final:
+            # 1. 중심점 거리 계산
             dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
-            if dist < dist_thresh:
+            # 2. 겹치는 면적 계산 (IoU)
+            iou = calculate_iou(curr['box'], k['box'])
+            
+            # 거리가 매우 가깝거나, 면적이 많이 겹치면 중복으로 간주
+            if dist < dist_thresh or iou > iou_thresh:
                 is_dup = True; break
         if not is_dup:
             final.append(curr)
@@ -40,11 +56,13 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석]
+# [3. 회로도 분석 (오인식 감소를 위해 conf 상향 조정)]
 # ==========================================
 def analyze_schematic(img, model):
-    # 인식률 높이기 위해 conf 낮게 설정
-    res = model.predict(source=img, conf=0.05, verbose=False)
+    # [수정 핵심] 엉뚱한 커패시터 인식을 막기 위해 신뢰도(conf)를 0.05 -> 0.25로 상향
+    # 이 값을 높일수록 AI가 확실한 것만 잡습니다. (오인식 감소, 미인식 증가 가능성 있음)
+    conf_threshold = 0.25 
+    res = model.predict(source=img, conf=conf_threshold, verbose=False)
     
     raw = []
     for b in res[0].boxes:
@@ -55,10 +73,12 @@ def analyze_schematic(img, model):
             'conf': float(b.conf[0])
         })
     
-    clean = solve_overlap(raw, dist_thresh=30)
+    # 중복 제거 (거리 30px 또는 IoU 0.3 이상이면 제거)
+    clean = solve_overlap(raw, dist_thresh=30, iou_thresh=0.3)
     
     for p in clean:
         name = p['name']
+        # 위치 기반 이름 보정 (왼쪽=Source)
         if p['center'][0] < img.shape[1] * 0.25: 
             name = 'source'
         elif 'cap' in name: name = 'capacitor'
@@ -75,7 +95,7 @@ def analyze_schematic(img, model):
     return img, summary
 
 # ==========================================
-# [4. 실물 분석 (Wire도 ON/OFF로 표시)]
+# [4. 실물 분석 (변경 없음 - 기존 로직 유지)]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
@@ -90,48 +110,60 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # 1. 핀 분류 (좌표 계산용) - wire는 제외 (bodies로 보냄)
+        # 핀 분류 (좌표용)
         if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
             pins.append(center) 
         elif 'breadboard' in name:
             continue
         else:
-            # bodies: 시각화 및 ON/OFF 판단 대상 (저항, 커패시터, **와이어 포함**)
-            bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf})
+            # bodies: 저항, 커패시터, 와이어 등 모든 부품
+            bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
     clean_bodies = solve_overlap(bodies, 60)
     
-    # [전원 공급 확인]
-    # 핀이나 와이어가 상단 전원부(h*0.45 위쪽)에 있으면 전원 ON 상태로 간주
+    # [1단계] 전원 레일 활성화 확인
     power_active = any(p[1] < h * 0.45 for p in pins)
     if not power_active:
          for b in clean_bodies:
             if 'wire' in b['name'] and b['center'][1] < h * 0.45:
                 power_active = True; break
     
+    # [2단계] 연결 상태 판단 (전파 로직 적용)
+    if power_active:
+        # 1. 직접 연결
+        for comp in clean_bodies:
+            cy = comp['center'][1]
+            if cy < h*0.48 or cy > h*0.52: 
+                comp['is_on'] = True
+
+        # 2. 간접 연결 (Propagation - 2회 반복)
+        for _ in range(2): 
+            for comp in clean_bodies:
+                if comp['is_on']: continue 
+                
+                # 내 근처에 켜진 부품 확인
+                cx, cy = comp['center']
+                for other in clean_bodies:
+                    if not other['is_on']: continue
+                    ocx, ocy = other['center']
+                    dist = math.sqrt((cx-ocx)**2 + (cy-ocy)**2)
+                    if dist < CONNECTION_THRESHOLD:
+                        comp['is_on'] = True
+                        break
+                
+                # 내 근처에 전원 핀 확인
+                if not comp['is_on']:
+                    for px, py in pins:
+                        if math.sqrt((cx-px)**2 + (cy-py)**2) < CONNECTION_THRESHOLD:
+                             if py < h*0.48 or py > h*0.52:
+                                comp['is_on'] = True; break
+
     off_count = 0
     
-    # [연결 상태 판단 & 시각화]
+    # [3단계] 시각화
     for comp in clean_bodies:
-        cx, cy = comp['center']
-        # name = comp['name'] # 이름 변수는 필요 시 사용
-        is_on = False
+        is_on = comp['is_on']
         
-        # [수정됨] Wire 별도 처리 로직 삭제 -> 모든 부품(Wire 포함) 동일하게 검사
-        
-        if power_active:
-            # 1. 직접 연결 (상단/하단 레일 영역에 부품 중심이 위치)
-            if cy < h*0.48 or cy > h*0.52:
-                is_on = True
-            else:
-                # 2. 간접 연결 (전원에 연결된 핀 근처에 위치)
-                for px, py in pins:
-                    if math.sqrt((cx-px)**2 + (cy-py)**2) < PIN_SENSITIVITY:
-                        # 그 핀이 전원 영역에 있어야 함
-                        if py < h*0.48 or py > h*0.52:
-                            is_on = True; break
-        
-        # 결과에 따른 색상 및 텍스트 설정
         if is_on:
             color = (0, 255, 0) # 초록 (ON)
             status = "ON"
@@ -140,7 +172,6 @@ def analyze_real(img, model):
             status = "OFF"
             off_count += 1
         
-        # 박스와 텍스트 그리기
         x1, y1, x2, y2 = map(int, comp['box'])
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
         cv2.putText(img, status, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
