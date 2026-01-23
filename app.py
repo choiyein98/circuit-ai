@@ -8,7 +8,7 @@ from PIL import Image
 # ==========================================
 # [1. 설정 및 라이브러리]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V14 (Strict Res / Status Board)", layout="wide")
+st.set_page_config(page_title="BrainBoard V15 (Overlap Fix)", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'
 MODEL_SYM_PATH = 'symbol.pt'
@@ -17,7 +17,7 @@ MODEL_SYM_PATH = 'symbol.pt'
 LEG_EXTENSION_RANGE = 180        
 
 # ==========================================
-# [2. 유틸리티 함수: 토너먼트 로직]
+# [2. 유틸리티 함수: 박스 통합 로직 강화]
 # ==========================================
 def calculate_iou(box1, box2):
     x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
@@ -28,27 +28,40 @@ def calculate_iou(box1, box2):
     return inter / union if union > 0 else 0
 
 def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4):
+    """
+    [V15 수정] 박스 안에 박스(Big vs Small) 문제를 해결하는 로직
+    """
     if not parts: return []
+    # 점수 높은 순 정렬
     parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
     final = []
     for curr in parts:
         is_dup = False
         for k in final:
-            iou = calculate_iou(curr['box'], k['box'])
-            if iou > iou_thresh:
-                is_dup = True; break
-            
+            # 좌표 계산
             x1 = max(curr['box'][0], k['box'][0])
             y1 = max(curr['box'][1], k['box'][1])
             x2 = min(curr['box'][2], k['box'][2])
             y2 = min(curr['box'][3], k['box'][3])
-            inter_area = max(0, x2-x1) * max(0, y2-y1)
-            curr_area = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
             
-            if curr_area > 0 and (inter_area / curr_area) > 0.7:
+            inter_area = max(0, x2-x1) * max(0, y2-y1)
+            area_curr = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
+            area_kept = (k['box'][2]-k['box'][0]) * (k['box'][3]-k['box'][1])
+            
+            # [핵심 수정] "두 박스 중 작은 것"을 기준으로 겹침 비율 계산
+            # 즉, 작은 박스가 큰 박스 안에 쏙 들어가 있다면(80% 이상), 중복으로 처리!
+            min_area = min(area_curr, area_kept)
+            
+            if min_area > 0 and (inter_area / min_area) > 0.8:
                 is_dup = True; break
 
+            # 2. 일반적인 IoU (많이 겹치면 제거)
+            iou = calculate_iou(curr['box'], k['box'])
+            if iou > iou_thresh:
+                is_dup = True; break
+
+            # 3. 거리 체크 (중심점이 너무 가까우면 제거)
             if dist_thresh > 0:
                 dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
                 if dist < dist_thresh:
@@ -116,7 +129,7 @@ def analyze_schematic(img, model):
     return img, {'total': len(clean), 'details': summary_details}
 
 # ==========================================
-# [4. 실물 분석: 저항 기준 60%로 상향]
+# [4. 실물 분석]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
@@ -132,10 +145,10 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # [핵심 수정] 저항 기준 60%로 강화
-        if 'cap' in name: min_conf = 0.15      # 커패시터: 15% (놓치지 않게)
-        elif 'res' in name: min_conf = 0.60    # [UP] 저항: 60% (가짜 컷)
-        elif 'wire' in name: min_conf = 0.15   # 와이어: 15%
+        # [설정 유지] 저항 0.60 / 커패시터 0.15
+        if 'cap' in name: min_conf = 0.15
+        elif 'res' in name: min_conf = 0.60
+        elif 'wire' in name: min_conf = 0.15
         else: min_conf = 0.25
             
         if conf < min_conf: continue
@@ -147,8 +160,8 @@ def analyze_real(img, model):
         else:
             bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
-    # 중복 제거
-    clean_bodies = solve_overlap(bodies, dist_thresh=50, iou_thresh=0.3)
+    # [핵심] 중복 제거 호출 (거리 기준도 60으로 약간 늘려서 확실히 잡음)
+    clean_bodies = solve_overlap(bodies, dist_thresh=60, iou_thresh=0.3)
     
     # [연결 로직]
     power_active = False
@@ -161,19 +174,16 @@ def analyze_real(img, model):
                 power_active = True; break
 
     if power_active:
-        # (1) 직접 연결
         for comp in clean_bodies:
             cy = comp['center'][1]
             if cy < h*0.48 or cy > h*0.52: 
                 comp['is_on'] = True
 
-        # (2) 간접 연결
         for _ in range(3): 
             for comp in clean_bodies:
                 if comp['is_on']: continue 
                 cx, cy = comp['center']
                 
-                # A. 핀(다리)
                 for p in pins:
                     px, py = p['center']
                     if py < h*0.48 or py > h*0.52:
@@ -183,7 +193,6 @@ def analyze_real(img, model):
 
                 if comp['is_on']: continue
 
-                # B. 다른 부품
                 for other in clean_bodies:
                     if not other['is_on']: continue
                     ocx, ocy = other['center']
@@ -221,7 +230,6 @@ def analyze_real(img, model):
             status = "OFF"
             off_count += 1
         
-        # 박스 표시
         display_text = f"{label_name}: {status}"
         x1, y1, x2, y2 = map(int, comp['box'])
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
@@ -232,7 +240,7 @@ def analyze_real(img, model):
 # ==========================================
 # [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V14 (Strict Res / Status Board)")
+st.title("🧠 BrainBoard V15 (Overlap Fix)")
 st.markdown("### 1. 부품 일치 여부")
 st.markdown("### 2. 연결 상태")
 
@@ -265,31 +273,24 @@ if ref_file and tgt_file:
 
             st.divider()
             
-            # ------------------------------------------------
-            # [신규 기능] 부품 현황판 (Status Board)
-            # ------------------------------------------------
             st.info("📊 **부품 인식 현황**")
             
-            # 저항 개수 비교
             r_ref = ref_data['details'].get('resistor', 0)
             r_tgt = tgt_data['details'].get('resistor', 0)
             st.write(f"- **저항 (Resistor):** 회로도 {r_ref}개 vs 실물 {r_tgt}개")
             
-            # 커패시터 개수 비교 (요청하신 부분!)
             c_ref = ref_data['details'].get('capacitor', 0)
             c_tgt = tgt_data['details'].get('capacitor', 0)
             st.write(f"- **커패시터 (Capacitor):** 회로도 {c_ref}개 vs 실물 {c_tgt}개")
 
             st.divider()
 
-            # 불일치 검사 (에러 메시지용)
             mismatch_errors = []
             if r_ref != r_tgt:
                 mismatch_errors.append(f"⚠️ RESISTOR 불일치: 회로도 {r_ref}개 vs 실물 {r_tgt}개")
             if c_ref != c_tgt:
                 mismatch_errors.append(f"⚠️ CAPACITOR 불일치: 회로도 {c_ref}개 vs 실물 {c_tgt}개")
             
-            # 이미지 출력
             st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석", use_column_width=True)
             st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 분석 (OFF: {tgt_data['off']})", use_column_width=True)
             
