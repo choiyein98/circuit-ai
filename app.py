@@ -8,17 +8,12 @@ from PIL import Image
 # ==========================================
 # [1. 설정 및 라이브러리]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V9 (Body Count / Leg Connect)", layout="wide")
+st.set_page_config(page_title="BrainBoard V10 (Wire Fix)", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'      # 실물 모델
 MODEL_SYM_PATH = 'symbol.pt'     # 회로도 모델
 
-# [핵심 설정]
-REAL_CONF_THRESH = 0.35          # 실물: 몸통을 확실히 잡기 위해 높임 (오인식 방지)
-SCHEMATIC_CONF_THRESH = 0.10     # 회로도: 일단 다 잡기 위해 낮춤
-
-# 연결 감지 범위 (몸통에서 다리가 뻗어나가는 범위라고 가정)
-# 이 값을 늘리면 부품이 멀리 있어도 연결된 것으로 간주합니다.
+# 연결 감지 범위 (몸통에서 다리가 뻗어나가는 범위)
 LEG_EXTENSION_RANGE = 180        
 
 # ==========================================
@@ -37,7 +32,6 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4):
     강력한 중복 제거 (토너먼트 방식)
     """
     if not parts: return []
-    # 신뢰도 높은 순으로 정렬 (확률 높은게 짱)
     parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
     final = []
@@ -57,11 +51,10 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4):
             inter_area = max(0, x2-x1) * max(0, y2-y1)
             curr_area = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
             
-            # 70% 이상 포함되면 중복 처리
             if curr_area > 0 and (inter_area / curr_area) > 0.7:
                 is_dup = True; break
 
-            # 3. 거리 (너무 가까우면 같은 부품으로 간주)
+            # 3. 거리
             if dist_thresh > 0:
                 dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
                 if dist < dist_thresh:
@@ -75,11 +68,11 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석 (기준 완화 + 강력 분류)]
+# [3. 회로도 분석 (기존 성공 로직 유지)]
 # ==========================================
 def analyze_schematic(img, model):
-    # 1. 0.10으로 낮춰서 일단 다 찾습니다. (놓치는 것 방지)
-    res = model.predict(source=img, conf=SCHEMATIC_CONF_THRESH, verbose=False)
+    # 회로도는 0.10으로 낮게 잡아서 다 찾아냄
+    res = model.predict(source=img, conf=0.10, verbose=False)
     
     raw = []
     for b in res[0].boxes:
@@ -94,10 +87,9 @@ def analyze_schematic(img, model):
             'conf': conf
         })
     
-    # 2. 중복 제거 (겹치면 점수 높은 놈만 남김)
     clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.2)
     
-    # 3. [강제 보정] 가장 왼쪽 = 전원 (Source)
+    # [강제 보정] 가장 왼쪽 = 전원 (Source)
     leftmost_idx = -1
     min_x = float('inf')
     if clean:
@@ -119,7 +111,6 @@ def analyze_schematic(img, model):
         elif 'dio' in raw_name: name = 'diode'
         elif any(x in raw_name for x in ['volt', 'batt', 'source']): name = 'source'
 
-        # 가장 왼쪽은 무조건 Source
         if i == leftmost_idx:
             name = 'source'
         
@@ -135,16 +126,16 @@ def analyze_schematic(img, model):
     return img, {'total': len(clean), 'details': summary_details}
 
 # ==========================================
-# [4. 실물 분석 (몸통 카운팅 + 다리 연결 확인)]
+# [4. 실물 분석 (와이어 인식 강화)]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
     
-    # 1. 몸통 인식을 위해 기준을 0.35로 높임 (잡동사니 제거)
-    res = model.predict(source=img, conf=REAL_CONF_THRESH, verbose=False)
+    # 1. 기본 스캔 (낮게 시작)
+    res = model.predict(source=img, conf=0.10, verbose=False)
     
     bodies = []
-    pins = [] # 핀/와이어 (연결 매개체)
+    pins = [] 
     
     for b in res[0].boxes:
         name = model.names[int(b.cls[0])].lower()
@@ -152,71 +143,80 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # 핀/와이어는 연결 확인용으로 따로 뺌 (개수엔 포함 안 함)
-        if any(x in name for x in ['pin', 'leg', 'lead', 'wire']):
+        # [핵심 수정 1] 부품별 인식 기준 (Dynamic Threshold)
+        if 'cap' in name:
+            min_conf = 0.45   # 커패시터: 엄격
+        elif 'res' in name:
+            min_conf = 0.35   # 저항: 적당히 엄격
+        elif 'wire' in name:
+            min_conf = 0.15   # [NEW] 와이어: 낮게 잡아서 인식률 높임
+        else:
+            min_conf = 0.25
+            
+        if conf < min_conf: continue
+
+        # [핵심 수정 2] 와이어를 'bodies'에 포함시킴 (기존엔 pins로 뺐었음)
+        # 이제 와이어도 박스가 쳐지고 ON/OFF 로직에 참여함
+        if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
             pins.append({'center': center, 'box': coords})
         elif 'breadboard' in name:
             continue
         else:
-            # 저항, 커패시터 등 '몸통'
+            # 저항, 커패시터, **와이어** 포함
             bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
-    # 중복 제거 (확실한 몸통만 남김)
+    # 중복 제거
     clean_bodies = solve_overlap(bodies, dist_thresh=50, iou_thresh=0.3)
     
     # ----------------------------------------------------
-    # [연결 로직 수정] 몸통 중심이 아닌 '영역'으로 판단
+    # [연결 로직]
     # ----------------------------------------------------
     
-    # 1. 전원 공급원(핀/와이어) 찾기 (상단 45%)
-    power_sources = []
-    for p in pins:
-        if p['center'][1] < h * 0.45:
-            power_sources.append(p)
+    # 1. 전원 공급원 찾기 (상단 45%)
+    power_active = False
     
-    # 전원이 하나라도 있으면 활성화 시작
-    power_active = len(power_sources) > 0
+    # 핀이나 와이어가 상단에 있으면 전원 ON
+    for b in clean_bodies:
+        if 'wire' in b['name'] and b['center'][1] < h * 0.45:
+            power_active = True; break
+            
     if not power_active:
-         # 핀이 없으면 상단에 있는 와이어형 부품이라도 찾음
-         for b in clean_bodies:
-            if 'wire' in b['name'] and b['center'][1] < h * 0.45:
-                power_active = True
-                power_sources.append(b) # 얘도 전원 소스 취급
-                break
+        for p in pins:
+            if p['center'][1] < h * 0.45:
+                power_active = True; break
 
-    # 2. 연결 상태 전파 (몸통 + 다리길이 고려)
+    # 2. 연결 상태 전파
     if power_active:
-        # (1) 직접 연결: 상단/하단 레일에 몸통이 걸쳐있는 경우
+        # (1) 직접 연결: 상단/하단 레일 영역
         for comp in clean_bodies:
             cy = comp['center'][1]
-            # 상단(0.48 이하) 또는 하단(0.52 이상) 레일 영역
             if cy < h*0.48 or cy > h*0.52: 
                 comp['is_on'] = True
 
-        # (2) 간접 연결: 전원 소스나 이미 켜진 부품 근처에 있는 경우
-        # 반복 횟수를 늘려(3회) 멀리 있는 부품까지 전기가 흐르게 함
+        # (2) 간접 연결 (3회 반복 - 멀리 퍼지도록)
         for _ in range(3): 
             for comp in clean_bodies:
                 if comp['is_on']: continue 
                 
                 cx, cy = comp['center']
                 
-                # A. 전원 핀/와이어와 가까운가? (다리 길이 고려하여 거리 기준 LEG_EXTENSION_RANGE 사용)
-                for src in power_sources:
-                    src_x, src_y = src['center']
-                    dist = math.sqrt((cx - src_x)**2 + (cy - src_y)**2)
-                    if dist < LEG_EXTENSION_RANGE:
-                        comp['is_on'] = True; break
-                
+                # A. 핀(다리)과 가까운가?
+                for p in pins:
+                    px, py = p['center']
+                    # 핀이 상단/하단 전원부에 있거나
+                    if py < h*0.48 or py > h*0.52:
+                         dist = math.sqrt((cx - px)**2 + (cy - py)**2)
+                         if dist < LEG_EXTENSION_RANGE:
+                             comp['is_on'] = True; break
+
                 if comp['is_on']: continue
 
-                # B. 이미 켜진 다른 부품과 가까운가?
+                # B. 이미 켜진 다른 부품(와이어 포함)과 가까운가?
                 for other in clean_bodies:
                     if not other['is_on']: continue
                     ocx, ocy = other['center']
                     dist = math.sqrt((cx - ocx)**2 + (cy - ocy)**2)
                     
-                    # 두 부품 간의 거리가 (다리길이 * 1.5) 이내면 연결된 것으로 간주
                     if dist < LEG_EXTENSION_RANGE * 1.5:
                         comp['is_on'] = True; break
 
@@ -232,6 +232,7 @@ def analyze_real(img, model):
         if 'res' in raw_name: norm_name = 'resistor'
         elif 'cap' in raw_name: norm_name = 'capacitor'
         
+        # 와이어는 개수 비교에서는 제외 (하지만 화면엔 표시됨)
         if 'wire' not in raw_name:
             real_details[norm_name] = real_details.get(norm_name, 0) + 1
 
@@ -245,7 +246,6 @@ def analyze_real(img, model):
         
         x1, y1, x2, y2 = map(int, comp['box'])
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
-        # 박스 위에 ON/OFF 표시
         cv2.putText(img, status, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         
     return img, {'off': off_count, 'total': len(clean_bodies), 'details': real_details}
@@ -253,9 +253,9 @@ def analyze_real(img, model):
 # ==========================================
 # [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V9 (Body Count / Leg Connect)")
-st.markdown("### 1. 부품 일치 여부 (몸통 인식)")
-st.markdown("### 2. 연결 상태 (다리 범위 포함)")
+st.title("🧠 BrainBoard V10 (Wire Fix)")
+st.markdown("### 1. 부품 일치 여부 (와이어 인식 추가)")
+st.markdown("### 2. 연결 상태 확인")
 
 @st.cache_resource
 def load_models():
