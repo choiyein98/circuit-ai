@@ -4,260 +4,279 @@ import numpy as np
 from ultralytics import YOLO
 import math
 from PIL import Image
+from collections import defaultdict
+import gc
 
 # ==========================================
-# [1. 설정 및 라이브러리]
+# [설정] BrainBoard V64: The Final Integration
 # ==========================================
-st.set_page_config(page_title="BrainBoard V36 (Circuit Integrity)", layout="wide")
+st.set_page_config(page_title="BrainBoard V64: Final", layout="wide")
 
-MODEL_REAL_PATH = 'best.pt'
+# [모델 경로] 가장 성능 좋은 모델 1개만 사용 (메모리 보호)
+REAL_MODEL_PATH = 'best(3).pt' 
 MODEL_SYM_PATH = 'symbol.pt'
-LEG_EXTENSION_RANGE = 180         
 
 # ==========================================
-# [2. 유틸리티 함수]
+# [Helper Functions] 기본 도구들
 # ==========================================
-def calculate_iou(box1, box2):
-    x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    union = area1 + area2 - inter
-    return inter / union if union > 0 else 0
-
-def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4, is_schematic=False):
-    if not parts: return []
-    if is_schematic:
-        parts.sort(key=lambda x: (x['box'][2]-x['box'][0]) * (x['box'][3]-x['box'][1]))
-    else:
-        parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
-    
-    final = []
-    for curr in parts:
-        is_dup = False
-        for k in final:
-            x1 = max(curr['box'][0], k['box'][0])
-            y1 = max(curr['box'][1], k['box'][1])
-            x2 = min(curr['box'][2], k['box'][2])
-            y2 = min(curr['box'][3], k['box'][3])
-            inter_area = max(0, x2-x1) * max(0, y2-y1)
-            
-            if is_schematic:
-                if inter_area > 0: is_dup = True; break
-                dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
-                if dist < 80: is_dup = True; break
-            else:
-                area_curr = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
-                area_k = (k['box'][2]-k['box'][0]) * (k['box'][3]-k['box'][1])
-                min_area = min(area_curr, area_k)
-                ratio = inter_area / min_area if min_area > 0 else 0
-                iou = calculate_iou(curr['box'], k['box'])
-                if ratio > 0.8: is_dup = True; break
-                if iou > iou_thresh: is_dup = True; break
-                if dist_thresh > 0:
-                    dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
-                    if dist < dist_thresh: is_dup = True; break
-        if not is_dup: final.append(curr)
-    return final
+def resize_image_smart(image, max_size=1024):
+    """메모리 폭발 방지를 위해 이미지 크기 자동 조절"""
+    h, w = image.shape[:2]
+    if max(h, w) > max_size:
+        scale = max_size / max(h, w)
+        new_w, new_h = int(w * scale), int(h * scale)
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return image
 
 def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
+def calculate_iou(box1, box2):
+    x1 = max(box1[0], box2[0]); y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2]); y2 = min(box1[3], box2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    union = ((box1[2]-box1[0])*(box1[3]-box1[1])) + ((box2[2]-box2[0])*(box2[3]-box2[1])) - inter
+    return inter / union if union > 0 else 0
+
+def get_x_overlap_ratio(box1, box2):
+    """회로도에서 위아래로 겹쳤는지 확인 (병렬 판단용)"""
+    x1_max = max(box1[0], box2[0]); x2_min = min(box1[2], box2[2])
+    return max(0, x2_min - x1_max) / (box1[2] - box1[0])
+
+def normalize_name(name):
+    """복잡한 클래스 이름을 표준 이름으로 통일"""
+    name = name.lower()
+    if 'res' in name: return 'resistor'
+    if 'cap' in name: return 'capacitor'
+    if 'wire' in name: return 'wire'
+    if any(x in name for x in ['source', 'batt', 'volt', 'vdc']): return 'source'
+    if any(x in name for x in ['leg', 'pin', 'lead']): return 'leg'
+    return name
+
+def solve_overlap_real(parts):
+    """중복된 박스 제거 (NMS)"""
+    if not parts: return []
+    parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
+    final = []
+    for curr in parts:
+        is_dup = False
+        for k in final:
+            iou = calculate_iou(curr['box'], k['box'])
+            dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
+            # 핀(leg)이 아니면 중복 제거 대상
+            if curr['name'] != 'leg' and (iou > 0.4 or dist < 60): 
+                is_dup = True; break
+        if not is_dup: final.append(curr)
+    return final
+
+def get_rel_key(n1, n2):
+    """관계 키 생성 (A-B와 B-A는 같음)"""
+    return " <-> ".join(sorted([n1, n2]))
+
 # ==========================================
-# [3. 회로도 분석]
+# [Core Algorithm] 회로 위상(Topology) 추출기
+# ==========================================
+def extract_circuit_topology(parts, connections):
+    """
+    부품 간 공유하는 노드 개수를 세어서 직렬/병렬을 판단하는 핵심 뇌
+    """
+    topology = []
+    for i in range(len(parts)):
+        for j in range(i + 1, len(parts)):
+            p1_name = parts[i]['name']
+            p2_name = parts[j]['name']
+            
+            # 와이어는 연결 도구일 뿐, 부품 관계 비교에선 제외
+            if p1_name == 'wire' or p2_name == 'wire': continue
+
+            nodes_1 = connections[i]
+            nodes_2 = connections[j]
+            
+            # 교집합 = 두 부품이 공유하는 노드들
+            shared_nodes = nodes_1.intersection(nodes_2)
+            num_shared = len(shared_nodes)
+            
+            rel_type = None
+            if num_shared >= 2:
+                rel_type = 'Parallel (병렬)' # 양쪽 다리 공유
+            elif num_shared == 1:
+                rel_type = 'Series (직렬)'   # 한쪽 다리 공유
+                if -1 in shared_nodes: rel_type = 'Connected to Power (전원 연결)'
+            
+            if rel_type:
+                topology.append({
+                    'key': get_rel_key(p1_name, p2_name),
+                    'type': rel_type,
+                    'debug_nodes': shared_nodes
+                })
+    return topology
+
+# ==========================================
+# [분석 1] 회로도 (Schematic) 분석
 # ==========================================
 def analyze_schematic(img, model):
-    res = model.predict(source=img, conf=0.15, verbose=False)
-    raw = []
-    for b in res[0].boxes:
-        cls_id = int(b.cls[0])
-        raw_name = model.names[cls_id].lower()
-        conf = float(b.conf[0])
-        
-        name = raw_name
-        if raw_name == 'v': name = 'source'
-        elif any(x in raw_name for x in ['volt', 'batt', 'source']): name = 'source'
-        elif 'cap' in raw_name: name = 'capacitor'
-        elif 'res' in raw_name: name = 'resistor'
-        elif 'ind' in raw_name: name = 'inductor'
-        elif 'dio' in raw_name: name = 'diode'
-        
-        raw.append({'name': name, 'box': b.xyxy[0].tolist(), 'center': get_center(b.xyxy[0].tolist()), 'conf': conf})
+    img = resize_image_smart(img) # 리사이징
+    results = model.predict(source=img, save=False, conf=0.05, verbose=False)
     
-    clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1, is_schematic=True)
-    
-    # 전원 보정
-    has_source = any(p['name'] == 'source' for p in clean)
-    if not has_source and clean:
-        min(clean, key=lambda p: p['center'][0])['name'] = 'source'
+    # 1. 인식 및 정규화
+    raw_parts = []
+    for box in results[0].boxes:
+        raw_name = model.names[int(box.cls[0])]
+        norm_name = normalize_name(raw_name)
+        coords = box.xyxy[0].tolist()
+        raw_parts.append({'name': norm_name, 'box': coords, 'center': get_center(coords), 'conf': float(box.conf[0])})
 
-    # [핵심] 회로도의 '첫 번째 관문' 부품 찾기
-    source_part = next((p for p in clean if p['name'] == 'source'), None)
-    first_part_name = None
-    
-    if source_part:
-        min_dist = float('inf')
-        for p in clean:
-            if p['name'] == 'source': continue
-            d = math.sqrt((source_part['center'][0]-p['center'][0])**2 + (source_part['center'][1]-p['center'][1])**2)
-            if d < min_dist:
-                min_dist = d
-                first_part_name = p['name']
-    
-    summary_details = {}
-    for p in clean:
-        name = p['name']
-        x1, y1, x2, y2 = map(int, p['box'])
-        if name == 'source':
-            box_color = (255, 0, 0)
-            disp_name = "V"
-        else:
-            box_color = (0, 0, 255)
-            disp_name = name
+    # 2. 중복 제거
+    parts = []
+    raw_parts.sort(key=lambda x: x['conf'], reverse=True)
+    for p in raw_parts:
+        if not any(calculate_iou(p['box'], k['box']) > 0.1 for k in parts): parts.append(p)
+
+    # 3. 전원(Source)이 없으면 가장 왼쪽 부품을 전원으로 가정 (보정)
+    if parts and not any(p['name'] == 'source' for p in parts):
+         leftmost = min(parts, key=lambda p: p['center'][0])
+         leftmost['name'] = 'source'
+
+    # 4. 기하학적 연결 추론 (회로도는 그림 위치가 곧 연결)
+    connections = defaultdict(set)
+    for i in range(len(parts)):
+        for j in range(i + 1, len(parts)):
+            p1, p2 = parts[i], parts[j]
+            overlap = get_x_overlap_ratio(p1['box'], p2['box'])
             
-        cv2.rectangle(img, (x1, y1), (x2, y2), box_color, 2)
-        cv2.putText(img, disp_name, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
-        summary_details[name] = summary_details.get(name, 0) + 1
-        
-    return img, {'total': len(clean), 'details': summary_details, 'first_conn': first_part_name}
+            # 위아래 겹침 -> 병렬 (가상 노드 2개 공유)
+            if overlap > 0.3: 
+                node_a = i * 100 + j; node_b = i * 100 + j + 1
+                connections[i].add(node_a); connections[i].add(node_b)
+                connections[j].add(node_a); connections[j].add(node_b)
+            # 좌우 인접 -> 직렬 (가상 노드 1개 공유)
+            elif abs(p1['center'][1] - p2['center'][1]) < 100 and abs(p1['center'][0] - p2['center'][0]) < 300:
+                node_common = i * 200 + j
+                connections[i].add(node_common); connections[j].add(node_common)
+
+    topology = extract_circuit_topology(parts, connections)
+    
+    # 시각화
+    for p in parts:
+        x1, y1, x2, y2 = map(int, p['box'])
+        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(img, p['name'], (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+    return img, {'parts': parts, 'topology': topology}
 
 # ==========================================
-# [4. 실물 분석]
+# [분석 2] 실물 보드 (Real) 분석 - 노드 알고리즘 적용
 # ==========================================
 def analyze_real(img, model):
+    img = resize_image_smart(img) # 리사이징
     h, w, _ = img.shape
-    res = model.predict(source=img, conf=0.10, verbose=False)
     
-    bodies = []
-    pins = [] 
+    raw_objects = []
+    res = model.predict(source=img, conf=0.10, verbose=False) # 인식률 10%까지 허용
     
     for b in res[0].boxes:
-        name = model.names[int(b.cls[0])].lower()
+        raw_name = model.names[int(b.cls[0])]
+        norm_name = normalize_name(raw_name)
         coords = b.xyxy[0].tolist()
-        center = get_center(coords)
         conf = float(b.conf[0])
         
-        if 'cap' in name: min_conf = 0.15
-        elif 'res' in name: min_conf = 0.60
-        elif 'wire' in name: min_conf = 0.15
-        else: min_conf = 0.25
-            
-        if conf < min_conf: continue
+        # 필터링 (너무 낮은 건 노이즈일 수 있으니 제거)
+        if norm_name == 'capacitor' and conf < 0.15: continue
+        if norm_name == 'resistor' and conf < 0.25: continue
+        if 'breadboard' in raw_name or 'hole' in raw_name: continue
+        
+        raw_objects.append({'name': norm_name, 'box': coords, 'center': get_center(coords), 'conf': conf})
 
-        if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
-            pins.append({'center': center, 'box': coords})
-        elif 'breadboard' in name:
+    # 1. 부품(Body)과 다리(Leg) 분리
+    parts_candidates = [p for p in raw_objects if p['name'] != 'leg']
+    legs = [p for p in raw_objects if p['name'] == 'leg']
+    parts = solve_overlap_real(parts_candidates)
+
+    # 2. 전원(Source) 유무 판단 (와이어 위치 기반 보정)
+    TOP_RAIL = h * 0.20; BOTTOM_RAIL = h * 0.80
+    has_source = False
+    
+    if any(p['name'] == 'source' for p in parts): has_source = True
+    if not has_source:
+        for p in parts + legs: # 와이어나 핀이 전원 레일에 있으면
+            if p['center'][1] < TOP_RAIL or p['center'][1] > BOTTOM_RAIL:
+                if p['name'] == 'wire' or p['name'] == 'leg':
+                    has_source = True; break
+    
+    # Source가 인식 안 됐어도 있다고 가정 (비교를 위해)
+    if has_source and not any(p['name'] == 'source' for p in parts):
+        parts.append({'name': 'source', 'box': [0,0,0,0], 'center': (0,0), 'conf': 1.0})
+
+    # 3. [핵심] 노드 클러스터링 (같은 세로줄 핀 찾기)
+    grouped_legs = []
+    for leg in legs:
+        assigned = False
+        for group in grouped_legs:
+            ref = group[0]
+            # X축 오차가 작고(같은 줄), Y축 오차가 적당하면(같은 블록)
+            if abs(leg['center'][0] - ref['center'][0]) < 25 and abs(leg['center'][1] - ref['center'][1]) < 80:
+                group.append(leg); assigned = True; break
+        if not assigned: grouped_legs.append([leg])
+
+    # 4. 부품과 노드 매핑 (Incidence Matrix 생성)
+    connections = defaultdict(set)
+    for i, part in enumerate(parts):
+        # 전원은 글로벌 노드(-1)
+        if part['name'] == 'source':
+            connections[i].add(-1)
             continue
-        else:
-            bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
-
-    clean_bodies = solve_overlap(bodies, dist_thresh=60, iou_thresh=0.3, is_schematic=False)
-    
-    # -----------------------------------------------------------
-    # [NEW] 전원 직결 부품 식별 (회로 구조 분석용)
-    # -----------------------------------------------------------
-    power_rail_top = h * 0.2
-    power_rail_bot = h * 0.8
-    direct_power_components = set()
-
-    power_wires = []
-    for b in clean_bodies:
-        if 'wire' in b['name']:
-            if b['center'][1] < power_rail_top or b['center'][1] > power_rail_bot:
-                power_wires.append(b)
-    
-    for comp in clean_bodies:
-        if 'wire' in comp['name']: continue
-        for wire in power_wires:
-            dist = math.sqrt((comp['center'][0]-wire['center'][0])**2 + (comp['center'][1]-wire['center'][1])**2)
-            if dist < 180: 
-                n_name = comp['name']
-                if 'res' in n_name: n_name = 'resistor'
-                elif 'cap' in n_name: n_name = 'capacitor'
-                direct_power_components.add(n_name)
-
-    # 연결 상태 확인 (기존 로직)
-    power_active = False
-    for b in clean_bodies:
-        if 'wire' in b['name'] and b['center'][1] < h * 0.45:
-            power_active = True; break
-    if not power_active:
-        for p in pins:
-            if p['center'][1] < h * 0.45:
-                power_active = True; break
-
-    if power_active:
-        for comp in clean_bodies:
-            cy = comp['center'][1]
-            if cy < h*0.48 or cy > h*0.52: comp['is_on'] = True
-
-        for _ in range(3): 
-            for comp in clean_bodies:
-                if comp['is_on']: continue 
-                cx, cy = comp['center']
-                for p in pins:
-                    px, py = p['center']
-                    if py < h*0.48 or py > h*0.52:
-                         dist = math.sqrt((cx - px)**2 + (cy - py)**2)
-                         if dist < LEG_EXTENSION_RANGE: comp['is_on'] = True; break
-                if comp['is_on']: continue
-                for other in clean_bodies:
-                    if not other['is_on']: continue
-                    ocx, ocy = other['center']
-                    dist = math.sqrt((cx - ocx)**2 + (cy - ocy)**2)
-                    if dist < LEG_EXTENSION_RANGE * 1.5: comp['is_on'] = True; break
-
-    off_count = 0
-    real_details = {} 
-    
-    for comp in clean_bodies:
-        is_on = comp['is_on']
-        raw_name = comp['name']
-        norm_name = raw_name
-        label_name = "" 
+            
+        # 부품 근처의 핀이 어느 노드(그룹)에 속했는지 확인
+        for nid, group in enumerate(grouped_legs):
+            for leg in group:
+                dist = math.sqrt((part['center'][0]-leg['center'][0])**2 + (part['center'][1]-leg['center'][1])**2)
+                diag = math.sqrt((part['box'][2]-part['box'][0])**2 + (part['box'][3]-part['box'][1])**2)
+                # 부품 몸통 근처(대각선 길이 정도)에 핀이 있으면 연결된 것
+                if dist < max(60, diag * 1.0):
+                    connections[i].add(nid)
         
-        if 'res' in raw_name: norm_name = 'resistor'; label_name = "RES"
-        elif 'cap' in raw_name: norm_name = 'capacitor'; label_name = "CAP"
-        elif 'wire' in raw_name: label_name = "WIRE"
-        else: label_name = raw_name[:3].upper()
-        
-        if 'wire' not in raw_name:
-            real_details[norm_name] = real_details.get(norm_name, 0) + 1
+        # 전원 레일(VCC/GND) 직접 접촉 확인
+        if part['box'][2] > 0: 
+             if part['center'][1] < TOP_RAIL or part['center'][1] > BOTTOM_RAIL:
+                 connections[i].add(-1)
 
-        if is_on:
+    topology = extract_circuit_topology(parts, connections)
+
+    # 5. 시각화
+    summary = {'parts': parts, 'topology': topology}
+    for p in parts:
+        if p['name'] == 'wire': continue # 와이어는 계산엔 쓰지만 화면엔 안 그림 (깔끔하게)
+        if p['box'][2] > 0: 
             color = (0, 255, 0)
-            status = "ON"
-        else:
-            color = (0, 0, 255)
-            status = "OFF"
-            off_count += 1
-        
-        x1, y1, x2, y2 = map(int, comp['box'])
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
-        cv2.putText(img, f"{label_name}: {status}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        
-    return img, {'off': off_count, 'total': len(clean_bodies), 'details': real_details, 'direct_conns': list(direct_power_components)}
+            if p['name'] == 'source': color = (0, 255, 255)
+            x1, y1, x2, y2 = map(int, p['box'])
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
+            label = p['name'][:3].upper()
+            cv2.putText(img, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    return img, summary
 
 # ==========================================
-# [5. 메인 UI]
+# [Main UI] 스트림릿 인터페이스
 # ==========================================
-st.title("🧠 BrainBoard V36: Circuit Integrity Check")
-st.markdown("### 회로도와 실물 회로가 '동일한 회로'인지 판별합니다.")
+st.title("🧠 BrainBoard V64: Final System")
+st.markdown("### ⚡ 부품 인식 + 노드(Node) 기반 회로 정밀 검증")
 
 @st.cache_resource
 def load_models():
-    return YOLO(MODEL_REAL_PATH), YOLO(MODEL_SYM_PATH)
+    gc.collect() # 메모리 청소
+    return YOLO(REAL_MODEL_PATH), YOLO(MODEL_SYM_PATH)
 
 try:
     model_real, model_sym = load_models()
-    st.sidebar.success("✅ 모델 로드 성공")
+    st.sidebar.success("✅ 시스템 준비 완료")
 except Exception as e:
     st.error(f"모델 로드 실패: {e}")
     st.stop()
 
 col1, col2 = st.columns(2)
-ref_file = col1.file_uploader("1. 회로도", type=['jpg', 'png', 'jpeg'])
-tgt_file = col2.file_uploader("2. 실물 사진", type=['jpg', 'png', 'jpeg'])
+ref_file = col1.file_uploader("1. 회로도 (Schematic)", type=['jpg', 'png', 'jpeg'])
+tgt_file = col2.file_uploader("2. 실물 사진 (Real Board)", type=['jpg', 'png', 'jpeg'])
 
 if ref_file and tgt_file:
     ref_image = Image.open(ref_file)
@@ -265,61 +284,74 @@ if ref_file and tgt_file:
     ref_cv = cv2.cvtColor(np.array(ref_image), cv2.COLOR_RGB2BGR)
     tgt_cv = cv2.cvtColor(np.array(tgt_image), cv2.COLOR_RGB2BGR)
 
-    if st.button("🚀 정밀 검증 실행"):
-        with st.spinner("회로 구조 분석 중..."):
+    if st.button("🚀 회로 분석 시작 (Analyze)"):
+        gc.collect()
+        with st.spinner("AI가 회로 노드(Node)를 추적 중입니다..."):
+            
             res_ref_img, ref_data = analyze_schematic(ref_cv.copy(), model_sym)
             res_tgt_img, tgt_data = analyze_real(tgt_cv.copy(), model_real)
 
-            st.divider()
+            # ------------------------------------------------
+            # 1. 부품 구성 확인 (BOM Check)
+            # ------------------------------------------------
+            st.subheader("1. 부품 구성 확인 (BOM)")
+            ref_counts = defaultdict(int)
+            tgt_counts = defaultdict(int)
+            for p in ref_data['parts']: ref_counts[p['name']] += 1
+            for p in tgt_data['parts']: tgt_counts[p['name']] += 1
             
-            # [결과 리포트]
-            r_ref = ref_data['details'].get('resistor', 0)
-            r_tgt = tgt_data['details'].get('resistor', 0)
-            c_ref = ref_data['details'].get('capacitor', 0)
-            c_tgt = tgt_data['details'].get('capacitor', 0)
+            all_keys = set(ref_counts.keys()) | set(tgt_counts.keys())
+            bom_match = True
+            bom_data = []
             
-            # ------------------------------------------------------------------
-            # [NEW] 회로 일치성(Circuit Integrity) 판단 로직
-            # ------------------------------------------------------------------
-            st.subheader("⚡ 회로 구조 진단 (Circuit Integrity)")
+            for k in all_keys:
+                if k == 'wire': continue # 와이어 개수는 무시 (연결 도구일 뿐)
+                r = ref_counts[k]; t = tgt_counts[k]
+                status = "✅ 일치" if r == t else "❌ 불일치"
+                bom_data.append({"부품명": k.upper(), "회로도": r, "실물": t, "상태": status})
+                if r != t: bom_match = False
             
-            expected_start = ref_data.get('first_conn')
-            actual_starts = tgt_data.get('direct_conns', [])
-            
-            diff_circuit = False # 회로가 다른가?
+            st.table(bom_data)
 
-            if expected_start and actual_starts:
-                if expected_start not in actual_starts:
-                    # 회로도의 첫 부품이 실물 전원부에 없음 -> 다른 회로임
-                    diff_circuit = True
-                    st.error(f"🚨 **회로 불일치 감지**: 회로도와 전혀 다른 회로입니다!")
-                    
-                    if expected_start == 'resistor' and 'capacitor' in actual_starts:
-                        st.markdown("""
-                        **[진단 내용]**
-                        - **회로도 (Schematic):** 전원이 `저항(Resistor)`을 먼저 통과하여 전류를 제한합니다. 
-                        - **실물 (Real Board):** 전원이 `커패시터(Capacitor)`에 직접 연결되었습니다. 
-                        - **위험성:** 저항 없이 전원이 커패시터에 직결되면 **과전류(Inrush Current)**가 흘러 부품이 손상될 수 있습니다.
-                        """)
+            # ------------------------------------------------
+            # 2. 회로 위상 검증 (Topology Check)
+            # ------------------------------------------------
+            st.subheader("2. 회로 연결 검증 (Topology)")
+            
+            # 비교를 위해 딕셔너리로 변환
+            ref_topo = {item['key']: item['type'] for item in ref_data['topology']}
+            tgt_topo = {item['key']: item['type'] for item in tgt_data['topology']}
+            
+            matches = []
+            errors = []
+            
+            for key, r_type in ref_topo.items():
+                if key in tgt_topo:
+                    t_type = tgt_topo[key]
+                    # 'Parallel' 이나 'Series'가 일치하는지 확인
+                    if r_type.split()[0] == t_type.split()[0]:
+                        matches.append(f"✅ {key} : {t_type} - 정상 연결")
+                    # 전원 연결은 Series의 일종으로 간주 (유연성)
+                    elif "Power" in t_type and "Series" in r_type:
+                        matches.append(f"✅ {key} : 전원부 연결 확인됨")
                     else:
-                        st.write(f"👉 회로도 시작 부품: **{expected_start.upper()}**")
-                        st.write(f"👉 실물 전원 직결 부품: **{', '.join([x.upper() for x in actual_starts])}**")
+                        errors.append(f"🚫 {key} : 회로도는 [{r_type}]인데 실물은 [{t_type}]입니다.")
+                else:
+                    errors.append(f"❌ {key} : 실물에서 연결이 끊겼습니다 (Open Circuit).")
             
-            if not diff_circuit:
-                st.success("✅ 회로도와 실물 회로의 구조가 일치합니다.")
-
-            st.divider()
-            
-            mismatch = []
-            if r_ref != r_tgt: mismatch.append("저항 개수 불일치")
-            if c_ref != c_tgt: mismatch.append("커패시터 개수 불일치")
-            
-            col_res1, col_res2 = st.columns(2)
-            col_res1.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption=f"회로도 (입력단: {expected_start})", use_column_width=True)
-            col_res2.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 (입력단: {actual_starts})", use_column_width=True)
-
-            if mismatch:
-                st.warning(f"⚠️ 부품 수량 차이: {', '.join(mismatch)}")
-            elif not diff_circuit and tgt_data['off'] == 0:
+            # 결과 출력
+            if not errors and len(matches) > 0 and bom_match:
+                st.success("🎉 완벽합니다! 부품 구성과 회로 연결이 정확합니다.")
                 st.balloons()
-                st.success("🎉 완벽합니다! (구조 일치 & 연결 성공)")
+            elif not matches and not errors:
+                 st.info("ℹ️ 부품 간 연결 관계를 찾지 못했습니다. 부품이 너무 멀리 떨어져 있나요?")
+            
+            for m in matches: st.caption(m)
+            for e in errors: st.error(e)
+
+            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석", use_column_width=True)
+            st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption="실물 분석 (Node Logic Applied)", use_column_width=True)
+            
+            # 메모리 정리
+            del res_ref_img, res_tgt_img
+            gc.collect()
