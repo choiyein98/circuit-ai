@@ -6,15 +6,15 @@ import math
 from PIL import Image
 
 # ==========================================
-# [설정] BrainBoard V56: Simple Visual
+# [설정] BrainBoard V57: Sensitivity Fix
 # ==========================================
-st.set_page_config(page_title="BrainBoard V56", layout="wide")
+st.set_page_config(page_title="BrainBoard V57", layout="wide")
 
 # [모델 설정]
 REAL_MODEL_PATHS = ['best.pt', 'best(2).pt', 'best(3).pt']
 MODEL_SYM_PATH = 'symbol.pt'
 LEG_EXTENSION_RANGE = 180
-SHORT_CIRCUIT_IOU = 0.6  # 합선 판단 기준
+SHORT_CIRCUIT_IOU = 0.6
 
 # ==========================================
 # [Helper Functions] 공통 함수
@@ -114,7 +114,7 @@ def analyze_schematic(img, model):
     return img, summary
 
 # ==========================================
-# [분석 2] 실물 보드 분석 (색상 조건 수정됨)
+# [분석 2] 실물 보드 분석 (저항 인식률 개선)
 # ==========================================
 def analyze_real_ensemble(img, model_list):
     h, w, _ = img.shape
@@ -130,10 +130,13 @@ def analyze_real_ensemble(img, model_list):
             coords = b.xyxy[0].tolist()
             center = get_center(coords)
             conf = float(b.conf[0])
+            
+            # [수정됨] 저항(Resistor)의 인식 임계값을 0.60 -> 0.25로 대폭 완화
             if 'cap' in name: min_conf = 0.15
-            elif 'res' in name: min_conf = 0.60
+            elif 'res' in name: min_conf = 0.25 # 기존 0.60에서 수정됨 (작은 저항 인식 강화)
             elif 'wire' in name: min_conf = 0.15
             else: min_conf = 0.25
+            
             if conf < min_conf: continue
 
             if any(x in name for x in ['pin', 'leg', 'lead']) and 'wire' not in name:
@@ -178,7 +181,7 @@ def analyze_real_ensemble(img, model_list):
                     dist = math.sqrt((cx - ocx)**2 + (cy - ocy)**2)
                     if dist < LEG_EXTENSION_RANGE * 1.5: comp['is_on'] = True; break
 
-    # 4. 쇼트(Short) 감지 - 회로 이론
+    # 4. 쇼트(Short) 감지
     for i, c1 in enumerate(clean_bodies):
         if 'wire' in c1['name']: continue
         for j, c2 in enumerate(clean_bodies):
@@ -208,18 +211,17 @@ def analyze_real_ensemble(img, model_list):
             if norm_name not in summary['details']: summary['details'][norm_name] = {'count': 0}
             summary['details'][norm_name]['count'] += 1
 
-        # [수정된 부분] 상태별 시각화 로직: 연결되면 무조건 초록색
         if is_short:
-            color = (0, 0, 255)    # Red (합선은 위험하므로 빨강 유지)
+            color = (0, 0, 255)    # Red
             status_text = "SHORT!" 
             summary['short'] += 1
             summary['off'] += 1
         elif is_on:
             summary['on'] += 1
-            color = (0, 255, 0)   # Green (무조건 초록색)
-            status_text = "ON"    # 텍스트도 깔끔하게 통일
+            color = (0, 255, 0)   # Green (무조건 초록)
+            status_text = "ON"
         else:
-            color = (0, 0, 255)   # Red (연결 안됨)
+            color = (0, 0, 255)   # Red
             status_text = "OFF"
             summary['off'] += 1
         
@@ -234,11 +236,10 @@ def analyze_real_ensemble(img, model_list):
 # ==========================================
 # [Main UI]
 # ==========================================
-st.title("🧠 BrainBoard V56: Safety & Simple")
+st.title("🧠 BrainBoard V57: Resistor Sensitivity Fix")
 st.markdown("""
-### ✅ 시스템 특징
-- **시각화**: 연결 확인 시 **무조건 초록색(ON)**으로 표시하여 혼동 방지
-- **안전 검증**: 부품이 겹쳐 합선(Short) 위험이 있을 경우에만 **빨간색(SHORT)** 경고
+### ✅ 업데이트 내역
+- **저항 인식률 개선**: 저항(Resistor) 감지 민감도를 대폭 완화하여(60% -> 25%) 인식되지 않던 부품을 잡아냅니다.
 """)
 
 @st.cache_resource
