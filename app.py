@@ -14,7 +14,7 @@ import os
 import base64
 
 # ==========================================
-# [설정] CircuitMate AI V72: Login & Save
+# [설정] CircuitMate AI V73: The End (With Delete)
 # ==========================================
 st.set_page_config(page_title="CircuitMate AI", layout="wide", page_icon="⚡")
 
@@ -81,7 +81,7 @@ def load_history_from_file(username):
     return []
 
 # ==========================================
-# [Core Logic] V69~V71 기존 로직 (변경 없음)
+# [Core Logic] V69 기존 로직 (변경 없음)
 # ==========================================
 def resize_image_smart(image, max_size=1024):
     h, w = image.shape[:2]
@@ -255,7 +255,7 @@ def render_result(result_data):
     st.markdown("### 📷 AI 인식 화면")
     img_col1, img_col2 = st.columns(2)
     with img_col1:
-        st.image(result_data['res_ref_img'], caption="회로도 분석", use_column_width=True)
+        st.image(result_data['res_ref_img'], caption="회로도 분석 (번호는 전류 흐름 순서)", use_column_width=True)
     with img_col2:
         st.image(result_data['res_tgt_img'], caption="실물 분석", use_column_width=True)
 
@@ -273,6 +273,8 @@ if 'username' not in st.session_state:
     st.session_state['username'] = ''
 if 'active_result' not in st.session_state:
     st.session_state['active_result'] = None
+if 'history' not in st.session_state:
+    st.session_state['history'] = []
 
 # ------------------------------------------------
 # 1. 로그인 화면 (Logged In == False)
@@ -337,14 +339,36 @@ else:
         st.divider()
         st.markdown("### 🕒 최근 검증 기록")
         
-        # 히스토리 표시 (최신순)
+        # [NEW] 삭제 기능이 포함된 히스토리 버튼 Loop
         if not st.session_state['history']:
             st.caption("기록이 없습니다.")
         else:
-            for idx, item in enumerate(reversed(st.session_state['history'])):
-                btn_label = f"{item['time']} - {item['status']}"
-                if st.button(btn_label, key=f"hist_{idx}", use_container_width=True):
-                    st.session_state['active_result'] = item
+            # 최신순(역순)으로 순회하되, 실제 삭제를 위해 인덱스는 뒤에서부터 접근
+            # Range: len-1 부터 0 까지 -1씩 감소 (최신 -> 과거)
+            for i in range(len(st.session_state['history']) - 1, -1, -1):
+                item = st.session_state['history'][i]
+                
+                # 버튼을 두 개로 나눔 (보기 / 삭제)
+                col_view, col_del = st.columns([4, 1])
+                
+                with col_view:
+                    btn_label = f"{item['time']} - {item['status']}"
+                    # 고유 키(key)를 줘서 충돌 방지
+                    if st.button(btn_label, key=f"view_{i}", use_container_width=True):
+                        st.session_state['active_result'] = item
+                
+                with col_del:
+                    # 삭제 버튼 (휴지통 아이콘)
+                    if st.button("🗑️", key=f"del_{i}"):
+                        # 1. 리스트에서 제거
+                        deleted_item = st.session_state['history'].pop(i)
+                        # 2. 파일에 저장 (영구 삭제 반영)
+                        save_history_to_file(st.session_state['username'], st.session_state['history'])
+                        # 3. 만약 현재 보고 있던 결과라면 화면 비우기
+                        if st.session_state['active_result'] == deleted_item:
+                            st.session_state['active_result'] = None
+                        # 4. 새로고침
+                        st.rerun()
 
     # [메인 콘텐츠]
     st.title("⚡ CircuitMate AI")
@@ -385,7 +409,7 @@ else:
                 if k == 'wire': continue
                 r = ref_counts[k]; t = tgt_counts[k]
                 status = "✅ 일치" if r == t else "⚠️ 확인 필요"
-                bom_data.append({"부품명": k.upper(), "회로도": r, "실물": t, "상태": status})
+                bom_data.append({"부품명": k.upper(), "회로도 개수": r, "실물 개수": t, "상태": status})
                 if r != t: bom_match = False
             
             ref_list = [p['name'] for p in ref_data['parts']]
@@ -412,7 +436,7 @@ else:
                 "res_tgt_img": cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB)
             }
 
-            # 세션 및 파일 저장 (영구 보존)
+            # 세션 및 파일 저장
             st.session_state['history'].append(result_packet)
             st.session_state['active_result'] = result_packet
             save_history_to_file(st.session_state['username'], st.session_state['history'])
