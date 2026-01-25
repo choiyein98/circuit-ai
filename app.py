@@ -4,148 +4,302 @@ import numpy as np
 from ultralytics import YOLO
 import math
 from PIL import Image
-import os
+from collections import defaultdict
 
 # ==========================================
-# [1. 설정 및 모든 모델 로드]
+# [설정] BrainBoard V56: Netlist & Role Check
 # ==========================================
-st.set_page_config(page_title="BrainBoard V55: Node-Flow Final", layout="wide")
+st.set_page_config(page_title="BrainBoard V56: Netlist", layout="wide")
 
-# 모든 모델 경로 (앙상블용)
-REAL_PATHS = ['best.pt', 'best(2).pt', 'best(3).pt']
-SYM_PATH = 'symbol.pt'
-
-@st.cache_resource
-def load_all_models():
-    real_models = [YOLO(p) for p in REAL_PATHS if os.path.exists(p)]
-    sym_model = YOLO(SYM_PATH) if os.path.exists(SYM_PATH) else None
-    return real_models, sym_model
-
-real_models, model_sym = load_all_models()
+REAL_MODEL_PATHS = ['best.pt', 'best(2).pt', 'best(3).pt']
+MODEL_SYM_PATH = 'symbol.pt'
 
 # ==========================================
-# [2. 이름 표준화 및 기하학 필터]
+# [Helper Functions]
 # ==========================================
-def normalize_name(raw_name):
-    name = raw_name.lower().strip()
-    if any(x in name for x in ['res', 'r']): return 'RESISTOR'
-    if any(x in name for x in ['cap', 'c']): return 'CAPACITOR'
-    if any(x in name for x in ['v', 'volt', 'batt', 'source', 'vdc']): return 'SOURCE'
-    if any(x in name for x in ['pin', 'leg', 'lead']): return 'PIN'
-    if 'wire' in name: return 'WIRE'
-    return 'OTHER'
+def get_center(box):
+    return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
-def is_wire_by_ratio(box):
-    x1, y1, x2, y2 = box
-    w, h = abs(x2-x1), abs(y2-y1)
-    if min(w, h) == 0: return True
-    return (max(w, h) / min(w, h)) > 6.0 # 너무 길쭉하면 와이어
+def calculate_iou(box1, box2):
+    x1 = max(box1[0], box2[0]); y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2]); y2 = min(box1[3], box2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    union = ((box1[2]-box1[0])*(box1[3]-box1[1])) + ((box2[2]-box2[0])*(box2[3]-box2[1])) - inter
+    return inter / union if union > 0 else 0
 
-# ==========================================
-# [3. 핵심: 노드(마디) 추적 및 토폴로지 분석]
-# ==========================================
-def get_node_id(x_coord, bb_box, total_nodes=63):
-    """브레드보드 영역 내에서 x좌표를 세로줄 번호(1~63)로 변환"""
-    bx1, _, bx2, _ = bb_box
-    width = bx2 - bx1
-    if width <= 0: return 0
-    node_idx = int(((x_coord - bx1) / width) * total_nodes)
-    return max(1, min(total_nodes, node_idx))
+def get_x_overlap_ratio(box1, box2):
+    x1_max = max(box1[0], box2[0]); x2_min = min(box1[2], box2[2])
+    return max(0, x2_min - x1_max) / (box1[2] - box1[0])
 
-def solve_overlap_with_nodes(parts, bb_box, iou_thresh=0.2):
+def solve_overlap(parts, is_real=False):
     if not parts: return []
-    parts.sort(key=lambda x: x['conf'], reverse=True)
+    parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     final = []
     for curr in parts:
-        curr['node'] = get_node_id(curr['center'][0], bb_box)
         is_dup = False
         for k in final:
-            # IoU 계산
-            ix1, iy1 = max(curr['box'][0], k['box'][0]), max(curr['box'][1], k['box'][1])
-            ix2, iy2 = min(curr['box'][2], k['box'][2]), min(curr['box'][3], k['box'][3])
-            inter = max(0, ix2-ix1) * max(0, iy2-iy1)
-            area1 = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
-            area2 = (k['box'][2]-k['box'][0]) * (k['box'][3]-k['box'][1])
-            iou = inter / (area1 + area2 - inter) if (area1 + area2 - inter) > 0 else 0
-            if iou > iou_thresh: is_dup = True; break
+            iou = calculate_iou(curr['box'], k['box'])
+            dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
+            if is_real:
+                if iou > 0.4 or dist < 60: is_dup = True; break
+            else:
+                if iou > 0.1: is_dup = True; break
         if not is_dup: final.append(curr)
     return final
 
-# ==========================================
-# [4. 분석 엔진: 실물 앙상블 + 흐름 검증]
-# ==========================================
-def analyze_real_flow(img, models):
-    h, w, _ = img.shape
-    all_raw = []
-    bb_box = [w*0.1, h*0.2, w*0.9, h*0.8] # 기본 브레드보드 영역 (인식 실패 대비)
+# [NEW] 관계(Netlist) 텍스트 생성기
+def generate_relation_key(name1, name2):
+    # 이름을 알파벳 순으로 정렬해서 "Res-Cap"과 "Cap-Res"를 동일하게 취급
+    names = sorted([name1, name2])
+    return f"{names[0]} <-> {names[1]}"
 
-    for m in models:
-        res = m.predict(source=img, conf=0.3, imgsz=640, verbose=False)
-        for b in res[0].boxes:
-            name = normalize_name(m.names[int(b.cls[0])])
-            coords = b.xyxy[0].tolist()
-            if 'breadboard' in m.names[int(b.cls[0])].lower(): bb_box = coords
-            if name in ['RESISTOR', 'CAPACITOR', 'SOURCE', 'WIRE']:
-                if name == 'RESISTOR' and is_wire_by_ratio(coords): name = 'WIRE'
-                all_raw.append({
-                    'name': name, 'box': coords, 'conf': float(b.conf[0]),
-                    'center': ((coords[0]+coords[2])/2, (coords[1]+coords[3])/2)
-                })
-
-    clean = solve_overlap_with_nodes(all_raw, bb_box)
+# ==========================================
+# [알고리즘 1] 회로도 넷리스트 추출
+# ==========================================
+def analyze_schematic_netlist(img, model):
+    results = model.predict(source=img, save=False, conf=0.05, verbose=False)
+    raw_parts = []
     
-    # [흐름 분석 로직]
-    # 회로도 흐름: SOURCE(Node 1) -> RESISTOR1(Node 1~10) -> (Node 10) -> CAP & RES2
-    nodes_content = {}
-    for p in clean:
-        if p['node'] not in nodes_content: nodes_content[p['node']] = []
-        nodes_content[p['node']].append(p['name'])
+    for box in results[0].boxes:
+        name = model.names[int(box.cls[0])].lower()
+        coords = box.xyxy[0].tolist()
+        base_name = name.split('_')[0].split(' ')[0]
+        if base_name in ['vdc', 'vsource', 'battery', 'voltage', 'v']: base_name = 'source'
+        if base_name in ['cap', 'c', 'capacitor']: base_name = 'capacitor'
+        if base_name in ['res', 'r', 'resistor']: base_name = 'resistor'
+        raw_parts.append({'name': base_name, 'box': coords, 'center': get_center(coords), 'conf': float(box.conf[0])})
 
-    errors = []
-    # 사용자 지적 사항: 커패시터가 소스에 직접 꽂히면 에러
-    for node, items in nodes_content.items():
-        if 'SOURCE' in items and 'CAPACITOR' in items:
-            errors.append(f"❌ 배선 오류: {node}번 노드에서 CAPACITOR가 전원에 직접 연결됨 (저항을 거쳐야 함)")
+    parts = solve_overlap(raw_parts, is_real=False)
 
-    # 시각화
-    for p in clean:
+    # 전원 보정
+    if parts and not any('source' in p['name'] for p in parts):
+         leftmost = min(parts, key=lambda p: p['center'][0])
+         leftmost['name'] = 'source'
+
+    connections = [] # [(부품1, 부품2, 관계유형)]
+    
+    # 기하학적 위치로 관계 추론
+    # 1. 병렬 (위아래 겹침)
+    for i in range(len(parts)):
+        for j in range(i + 1, len(parts)):
+            p1, p2 = parts[i], parts[j]
+            overlap = get_x_overlap_ratio(p1['box'], p2['box'])
+            
+            if overlap > 0.3: # 위아래로 겹침
+                connections.append({'p1': p1['name'], 'p2': p2['name'], 'type': 'Parallel'})
+                # 시각화
+                cv2.rectangle(img, (int(p1['box'][0]), int(p1['box'][1])), (int(p2['box'][2]), int(p2['box'][3])), (255, 0, 255), 2)
+            
+            # 2. 직렬 (바로 옆에 있음, Y축 비슷)
+            elif abs(p1['center'][1] - p2['center'][1]) < 100:
+                dist = abs(p1['center'][0] - p2['center'][0])
+                if dist < 300: # 적당히 가까움
+                    connections.append({'p1': p1['name'], 'p2': p2['name'], 'type': 'Series'})
+
+    summary = {'parts': parts, 'connections': connections}
+    
+    # 부품 그리기
+    for p in parts:
         x1, y1, x2, y2 = map(int, p['box'])
-        status_color = (0, 255, 0) # 기본 초록
-        # 에러 노드에 포함된 부품은 빨간색으로 표시
-        for err in errors:
-            if str(p['node']) in err: status_color = (0, 0, 255)
-        
-        cv2.rectangle(img, (x1, y1), (x2, y2), status_color, 3)
-        cv2.putText(img, f"{p['name']}(N{p['node']})", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(img, p['name'], (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-    return img, {'details': clean, 'errors': errors}
+    return img, summary
 
 # ==========================================
-# [5. UI 실행부]
+# [알고리즘 2] 실물 넷리스트 추출 (노드 기반)
 # ==========================================
-st.title("🧠 BrainBoard V55: Topology Flow Analysis")
-st.markdown("### 실물 배선 순서 및 노드(세로줄) 일치 여부 정밀 분석")
+def analyze_real_netlist(img, model_list):
+    h, w, _ = img.shape
+    raw_bodies = []
+    raw_legs = [] 
+
+    # 1. 앙상블 탐지
+    for model in model_list:
+        res = model.predict(source=img, conf=0.10, verbose=False)
+        for b in res[0].boxes:
+            name = model.names[int(b.cls[0])].lower()
+            coords = b.xyxy[0].tolist()
+            conf = float(b.conf[0])
+            
+            # 필터링
+            if 'cap' in name and conf < 0.15: continue
+            if 'res' in name and conf < 0.30: continue # V49 기준 적용
+            if 'breadboard' in name or 'hole' in name: continue
+            
+            center = get_center(coords)
+            
+            if any(x in name for x in ['pin', 'leg', 'lead']):
+                raw_legs.append({'box': coords, 'center': center})
+            elif 'wire' not in name: 
+                raw_bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf})
+
+    parts = solve_overlap(raw_bodies, is_real=True)
+
+    # 2. 노드(Node) 클러스터링 (세로줄 그룹화)
+    grouped_legs = []
+    for leg in raw_legs:
+        assigned = False
+        for group in grouped_legs:
+            ref = group[0] 
+            # X축이 비슷하고(25px), Y축도 적당히(80px)
+            if abs(leg['center'][0] - ref['center'][0]) < 25 and abs(leg['center'][1] - ref['center'][1]) < 80:
+                group.append(leg); assigned = True; break
+        if not assigned: grouped_legs.append([leg])
+
+    # 3. 부품-노드 연결 매핑
+    part_connections = defaultdict(set)
+    for i, part in enumerate(parts):
+        for nid, group in enumerate(grouped_legs):
+            for leg in group:
+                dist = math.sqrt((part['center'][0]-leg['center'][0])**2 + (part['center'][1]-leg['center'][1])**2)
+                diag = math.sqrt((part['box'][2]-part['box'][0])**2 + (part['box'][3]-part['box'][1])**2)
+                if dist < diag * 0.9: # 부품 근처에 있는 핀
+                    part_connections[i].add(nid)
+
+    # 4. 부품 간 관계(Netlist) 도출
+    connections = []
+    
+    for i in range(len(parts)):
+        for j in range(i + 1, len(parts)):
+            nodes_i = part_connections[i]
+            nodes_j = part_connections[j]
+            shared_nodes = nodes_i.intersection(nodes_j)
+            
+            p1_name = parts[i]['name'].split('_')[0] # res_1 -> res
+            p2_name = parts[j]['name'].split('_')[0]
+
+            if len(shared_nodes) >= 2: # 노드 2개 공유 = 병렬
+                connections.append({'p1': p1_name, 'p2': p2_name, 'type': 'Parallel'})
+                # 병렬 시각화 (보라색 선)
+                cv2.line(img, (int(parts[i]['center'][0]), int(parts[i]['center'][1])),
+                         (int(parts[j]['center'][0]), int(parts[j]['center'][1])), (255, 0, 255), 3)
+            
+            elif len(shared_nodes) == 1: # 노드 1개 공유 = 직렬
+                connections.append({'p1': p1_name, 'p2': p2_name, 'type': 'Series'})
+                # 직렬 시각화 (청록색 선)
+                cv2.line(img, (int(parts[i]['center'][0]), int(parts[i]['center'][1])),
+                         (int(parts[j]['center'][0]), int(parts[j]['center'][1])), (255, 255, 0), 2)
+
+    # 부품 그리기 & 이름 정규화
+    summary = {'parts': parts, 'connections': connections}
+    for p in parts:
+        norm_name = p['name']
+        if 'res' in norm_name: norm_name = 'resistor'
+        elif 'cap' in norm_name: norm_name = 'capacitor'
+        p['name'] = norm_name # 이름 업데이트
+
+        color = (0, 255, 0) # 기본 녹색
+        if 'source' in norm_name: color = (0, 255, 255) # 전원은 노란색
+
+        x1, y1, x2, y2 = map(int, p['box'])
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
+        cv2.putText(img, norm_name[:3].upper(), (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    return img, summary
+
+# ==========================================
+# [Main UI]
+# ==========================================
+st.title("🧠 BrainBoard V56: Netlist Validator")
+st.markdown("### 🔍 부품의 역할과 연결 관계(Netlist) 정밀 검증")
+
+@st.cache_resource
+def load_models():
+    reals = []
+    try:
+        for p in REAL_MODEL_PATHS: reals.append(YOLO(p))
+    except: pass
+    return reals, YOLO(MODEL_SYM_PATH)
+
+try:
+    models_real, model_sym = load_models()
+    if not models_real: st.stop()
+    st.sidebar.success("✅ 시스템 준비 완료")
+except: st.stop()
 
 col1, col2 = st.columns(2)
-ref_file = col1.file_uploader("1. PSpice 회로도 업로드", type=['jpg', 'png', 'jpeg'])
-tgt_file = col2.file_uploader("2. 실물 보드 사진 업로드", type=['jpg', 'png', 'jpeg'])
+ref_file = col1.file_uploader("1. 회로도", type=['jpg', 'png', 'jpeg'])
+tgt_file = col2.file_uploader("2. 실물 사진", type=['jpg', 'png', 'jpeg'])
 
 if ref_file and tgt_file:
-    if st.button("🚀 전체 회로 흐름 분석 시작"):
-        with st.spinner("마디(Node) 단위로 회로를 추적 중..."):
-            ref_img = cv2.cvtColor(np.array(Image.open(ref_file)), cv2.COLOR_RGB2BGR)
-            tgt_img = cv2.cvtColor(np.array(Image.open(tgt_file)), cv2.COLOR_RGB2BGR)
+    ref_image = Image.open(ref_file)
+    tgt_image = Image.open(tgt_file)
+    ref_cv = cv2.cvtColor(np.array(ref_image), cv2.COLOR_RGB2BGR)
+    tgt_cv = cv2.cvtColor(np.array(tgt_image), cv2.COLOR_RGB2BGR)
 
-            # 회로도 분석 (기존 잘 작동하는 V35 로직 유지)
-            # res_ref_img, data_ref = analyze_schematic(ref_img, model_sym) 
+    if st.button("🚀 Netlist 분석 실행"):
+        with st.spinner("회로 넷리스트 추출 및 비교 중..."):
             
-            # 실물 흐름 분석 (앙상블 + 노드 추적)
-            res_tgt_img, tgt_result = analyze_real_flow(tgt_img, real_models)
+            res_ref_img, ref_data = analyze_schematic_netlist(ref_cv.copy(), model_sym)
+            res_tgt_img, tgt_data = analyze_real_netlist(tgt_cv.copy(), models_real)
 
-            st.divider()
-            if tgt_result['errors']:
-                for err in tgt_result['errors']: st.error(err)
-            else:
-                st.success("✅ 분석 결과: 모든 부품이 올바른 순서(Node)로 배선되었습니다.")
+            # ------------------------------------------------
+            # 1. 부품 목록 비교 (Bill of Materials)
+            # ------------------------------------------------
+            st.subheader("1. 부품 목록 (BOM)")
+            ref_counts = defaultdict(int)
+            tgt_counts = defaultdict(int)
+            for p in ref_data['parts']: ref_counts[p['name']] += 1
+            for p in tgt_data['parts']: tgt_counts[p['name']] += 1
+            
+            all_keys = set(ref_counts.keys()) | set(tgt_counts.keys())
+            bom_match = True
+            for k in all_keys:
+                if k == 'wire': continue
+                r = ref_counts[k]; t = tgt_counts[k]
+                if r != t:
+                    st.error(f"⚠️ {k} 개수 불일치 ({r} vs {t})")
+                    bom_match = False
+                else:
+                    st.success(f"✅ {k} 개수 일치 ({r})")
 
-            st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption="실물 보드 마디 분석 (N=노드번호)", use_column_width=True)
+            # ------------------------------------------------
+            # 2. 연결 관계(Netlist) 비교 (핵심!)
+            # ------------------------------------------------
+            st.subheader("2. 연결 관계 및 역할 검증 (Netlist Check)")
+            
+            # 회로도 관계 리스트 만들기
+            ref_relations = set()
+            for c in ref_data['connections']:
+                key = generate_relation_key(c['p1'], c['p2'])
+                ref_relations.add((key, c['type']))
+            
+            # 실물 관계 리스트 만들기
+            tgt_relations = set()
+            for c in tgt_data['connections']:
+                key = generate_relation_key(c['p1'], c['p2'])
+                tgt_relations.add((key, c['type']))
+
+            # 비교 로직
+            matches = []
+            missings = []
+            
+            # 회로도에 있는게 실물에 있는가?
+            for rel in ref_relations:
+                key, type_ = rel
+                # 실물에서 키가 같은게 있는지 확인 (타입은 다를 수도 있으니 키로 먼저 검색)
+                found = False
+                for t_rel in tgt_relations:
+                    if t_rel[0] == key:
+                        found = True
+                        if t_rel[1] == type_:
+                            matches.append(f"✅ [일치] {key} : {type_} 연결됨")
+                        else:
+                            missings.append(f"⚠️ [오류] {key} : 회로도는 {type_}인데 실물은 {t_rel[1]}임")
+                        break
+                if not found:
+                    missings.append(f"❌ [끊김] {key} : 실물에서 연결되지 않음")
+
+            if not missings and len(matches) > 0:
+                st.success("🎉 모든 부품의 연결 관계와 역할이 완벽하게 일치합니다!")
+                st.balloons()
+            elif not matches and not missings:
+                 st.info("ℹ️ 감지된 연결 관계가 없습니다. 부품이 너무 멀리 떨어져 있나요?")
+            
+            for m in matches: st.caption(m)
+            for m in missings: st.error(m)
+
+            # 이미지 출력
+            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 Netlist", use_column_width=True)
+            st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption="실물 Netlist (보라색=병렬, 청록색=직렬)", use_column_width=True)
