@@ -8,14 +8,14 @@ from PIL import Image
 # ==========================================
 # [1. 설정 및 라이브러리]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V34 (User-Trained Trust)", layout="wide")
+st.set_page_config(page_title="BrainBoard V35 (Auto-Fixed)", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'
 MODEL_SYM_PATH = 'symbol.pt'
 LEG_EXTENSION_RANGE = 180        
 
 # ==========================================
-# [2. 유틸리티 함수: 순수 중복 제거]
+# [2. 유틸리티 함수: 껍데기 박멸 & 중복 제거]
 # ==========================================
 def calculate_iou(box1, box2):
     x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
@@ -29,19 +29,19 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4, is_schematic=False):
     if not parts: return []
     
     # -----------------------------------------------------------
-    # [정렬 전략]
+    # [정렬 전략] 
+    # 회로도: '크기순(작은거 우선)' -> 껍데기 제거용
+    # 실물: '점수순(확실한거 우선)' -> 정확도용
     # -----------------------------------------------------------
     if is_schematic:
-        # 회로도: 면적이 작은 순서대로 정렬 (작은 알맹이를 우선시)
+        # 면적이 작은 순서대로 정렬 (진짜 심볼은 작고, 텍스트 박스는 크기 때문)
         parts.sort(key=lambda x: (x['box'][2]-x['box'][0]) * (x['box'][3]-x['box'][1]))
     else:
-        # 실물: 신뢰도 순
+        # 실물은 신뢰도 높은 순
         parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
     final = []
     for curr in parts:
-        # [수정] 사용자가 학습시킨 모델을 믿고, 기하학적 필터(모양 보고 삭제)를 모두 제거했습니다.
-        
         is_dup = False
         for k in final:
             # 좌표 및 면적 계산
@@ -53,26 +53,20 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4, is_schematic=False):
             inter_area = max(0, x2-x1) * max(0, y2-y1)
             
             # -----------------------------------------------------------
-            # [MODE A] 회로도 전용 (순수 겹침 제거)
+            # [MODE A] 회로도 전용 (껍데기 제거 로직)
             # -----------------------------------------------------------
             if is_schematic:
-                # k: 이미 등록된 작은 박스
-                # curr: 지금 들어온 큰 박스
+                # k: 이미 등록된 '작은 진짜 박스'
+                # curr: 지금 검사하는 '큰 박스' (나중에 들어옴)
                 
-                # 1. 겹침 발생 시 (완전히 겹치거나 포함될 때만)
-                # 모델이 직접 찾은거니까, '살짝 닿는 것' 정도는 허용할 수도 있음.
-                # 하지만 '확실히 겹친다'면 큰 박스(curr)를 껍데기로 보고 제외.
+                # [조건 1] 겹침 발생 시 (IoU > 0)
+                # 작은 박스(k)가 이미 있는데, 큰 박스(curr)가 그 위를 덮거나 닿았다? -> 삭제
                 if inter_area > 0:
-                    area_k = (k['box'][2]-k['box'][0]) * (k['box'][3]-k['box'][1])
-                    overlap_ratio = inter_area / area_k # 작은 박스 기준 겹침 비율
-                    
-                    # 작은 박스가 50% 이상 덮이면 중복으로 간주
-                    if overlap_ratio > 0.5:
-                        is_dup = True; break
+                    is_dup = True; break
                 
-                # 2. 거리 기반 (완전히 똑같은 위치에 여러 개 잡히는 것 방지)
+                # [조건 2] 거리 기반 삭제 (텍스트 박스 제거)
                 dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
-                if dist < 50: # 아주 가까우면 중복
+                if dist < 80:
                     is_dup = True; break
 
             # -----------------------------------------------------------
@@ -82,6 +76,7 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4, is_schematic=False):
                 area_curr = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
                 area_k = (k['box'][2]-k['box'][0]) * (k['box'][3]-k['box'][1])
                 min_area = min(area_curr, area_k)
+                
                 ratio = inter_area / min_area if min_area > 0 else 0
                 iou = calculate_iou(curr['box'], k['box'])
                 
@@ -100,11 +95,11 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석]
+# [3. 회로도 분석 (자동 설정)]
 # ==========================================
-def analyze_schematic(img, model, conf_thresh):
-    # 슬라이더 값 적용
-    res = model.predict(source=img, conf=conf_thresh, verbose=False)
+def analyze_schematic(img, model):
+    # [설정 고정] 0.15 : 노이즈는 피하고, 학습된 커패시터는 잡는 최적값
+    res = model.predict(source=img, conf=0.15, verbose=False)
     
     raw = []
     for b in res[0].boxes:
@@ -112,7 +107,7 @@ def analyze_schematic(img, model, conf_thresh):
         raw_name = model.names[cls_id].lower()
         conf = float(b.conf[0])
         
-        # [이름 매핑] 'v' -> 'source' 변환은 유지 (이건 필요하다고 하셨으니까요)
+        # [핵심] 'V' 라벨 인식 추가
         name = raw_name
         if raw_name == 'v': 
             name = 'source'
@@ -130,12 +125,13 @@ def analyze_schematic(img, model, conf_thresh):
             'conf': conf
         })
     
-    # 중복 제거 (필터 없이 순수 중복만 체크)
+    # [핵심] 껍데기 박멸 로직 적용
     clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1, is_schematic=True)
     
-    # 전원 위치 보정
+    # 전원 위치 보정 (전원이 하나도 없을 때만)
     leftmost_idx = -1
     min_x = float('inf')
+    
     has_source = any(p['name'] == 'source' for p in clean)
     if not has_source and clean:
         for i, p in enumerate(clean):
@@ -153,11 +149,12 @@ def analyze_schematic(img, model, conf_thresh):
         
         x1, y1, x2, y2 = map(int, p['box'])
         
+        # 색상 설정 (V=파랑, 나머지=빨강)
         if name == 'source':
-            box_color = (255, 0, 0) # Blue
+            box_color = (255, 0, 0) # Blue (OpenCV BGR)
             disp_name = "V"
         else:
-            box_color = (0, 0, 255) # Red
+            box_color = (0, 0, 255) # Red (OpenCV BGR)
             disp_name = name
             
         cv2.rectangle(img, (x1, y1), (x2, y2), box_color, 2)
@@ -168,9 +165,9 @@ def analyze_schematic(img, model, conf_thresh):
     return img, {'total': len(clean), 'details': summary_details}
 
 # ==========================================
-# [4. 실물 분석 (사용자 튜닝)]
+# [4. 실물 분석 (자동 설정)]
 # ==========================================
-def analyze_real(img, model, conf_res, conf_cap, conf_wire):
+def analyze_real(img, model):
     h, w, _ = img.shape
     
     res = model.predict(source=img, conf=0.10, verbose=False)
@@ -184,10 +181,10 @@ def analyze_real(img, model, conf_res, conf_cap, conf_wire):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # 슬라이더 값 적용
-        if 'cap' in name: min_conf = conf_cap
-        elif 'res' in name: min_conf = conf_res
-        elif 'wire' in name: min_conf = conf_wire
+        # [설정 고정] 사용자님이 만족하셨던 V15 최적값
+        if 'cap' in name: min_conf = 0.15
+        elif 'res' in name: min_conf = 0.60
+        elif 'wire' in name: min_conf = 0.15
         else: min_conf = 0.25
             
         if conf < min_conf: continue
@@ -199,7 +196,7 @@ def analyze_real(img, model, conf_res, conf_cap, conf_wire):
         else:
             bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
-    # 실물 중복 제거
+    # 실물 중복 제거 (기존 방식)
     clean_bodies = solve_overlap(bodies, dist_thresh=60, iou_thresh=0.3, is_schematic=False)
     
     # [연결 로직]
@@ -277,10 +274,10 @@ def analyze_real(img, model, conf_res, conf_cap, conf_wire):
     return img, {'off': off_count, 'total': len(clean_bodies), 'details': real_details}
 
 # ==========================================
-# [5. 메인 UI (튜너 추가)]
+# [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V34: User-Trained Trust")
-st.markdown("### 민감도를 직접 조절하여 모든 회로에 대응하세요.")
+st.title("🧠 BrainBoard V35: Auto-Fixed")
+st.markdown("### 회로도와 실물 사진을 업로드하세요.")
 
 @st.cache_resource
 def load_models():
@@ -293,24 +290,6 @@ except Exception as e:
     st.error(f"모델 로드 실패: {e}")
     st.stop()
 
-# ------------------------------------------------------------------
-# [SIDEBAR] 민감도 조절 슬라이더
-# ------------------------------------------------------------------
-st.sidebar.header("🎛️ 분석 민감도 설정")
-
-# 회로도 설정
-st.sidebar.markdown("---")
-st.sidebar.subheader("📄 회로도 설정")
-# 사용자가 직접 학습시켰으므로, 기본값을 적당히(0.15) 두어 노이즈만 거릅니다.
-conf_sym = st.sidebar.slider("회로도 인식 민감도", 0.0, 1.0, 0.15, 0.05) 
-
-# 실물 설정
-st.sidebar.markdown("---")
-st.sidebar.subheader("📸 실물 설정")
-conf_res = st.sidebar.slider("저항(Resistor) 민감도", 0.0, 1.0, 0.40, 0.05)
-conf_cap = st.sidebar.slider("커패시터(Capacitor) 민감도", 0.0, 1.0, 0.20, 0.05)
-conf_wire = st.sidebar.slider("와이어(Wire) 민감도", 0.0, 1.0, 0.15, 0.05)
-
 col1, col2 = st.columns(2)
 ref_file = col1.file_uploader("1. 회로도 업로드", type=['jpg', 'png', 'jpeg'])
 tgt_file = col2.file_uploader("2. 실물 사진 업로드", type=['jpg', 'png', 'jpeg'])
@@ -322,11 +301,11 @@ if ref_file and tgt_file:
     ref_cv = cv2.cvtColor(np.array(ref_image), cv2.COLOR_RGB2BGR)
     tgt_cv = cv2.cvtColor(np.array(tgt_image), cv2.COLOR_RGB2BGR)
 
-    # 버튼 누를 때 슬라이더 값을 함수로 전달
     if st.button("🚀 정밀 분석 실행"):
-        with st.spinner("사용자 설정 적용 중..."):
-            res_ref_img, ref_data = analyze_schematic(ref_cv.copy(), model_sym, conf_sym)
-            res_tgt_img, tgt_data = analyze_real(tgt_cv.copy(), model_real, conf_res, conf_cap, conf_wire)
+        with st.spinner("AI 분석 중..."):
+            # 이제 슬라이더 값 없이 내부 고정값으로 실행됩니다.
+            res_ref_img, ref_data = analyze_schematic(ref_cv.copy(), model_sym)
+            res_tgt_img, tgt_data = analyze_real(tgt_cv.copy(), model_real)
 
             st.divider()
             
@@ -348,7 +327,7 @@ if ref_file and tgt_file:
             if c_ref != c_tgt:
                 mismatch_errors.append(f"⚠️ CAPACITOR 불일치: 회로도 {c_ref}개 vs 실물 {c_tgt}개")
             
-            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 결과", use_column_width=True)
+            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (자동 최적화)", use_column_width=True)
             st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 분석 (OFF: {tgt_data['off']})", use_column_width=True)
             
             if mismatch_errors:
