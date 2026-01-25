@@ -8,7 +8,7 @@ from PIL import Image
 # ==========================================
 # [1. 설정 및 라이브러리]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V25 (Shell Remover)", layout="wide")
+st.set_page_config(page_title="BrainBoard V26 ('V' Label & Shell Fix)", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'
 MODEL_SYM_PATH = 'symbol.pt'
@@ -17,7 +17,7 @@ MODEL_SYM_PATH = 'symbol.pt'
 LEG_EXTENSION_RANGE = 180        
 
 # ==========================================
-# [2. 유틸리티 함수: 껍데기 제거 로직]
+# [2. 유틸리티 함수: 껍데기 박멸 로직]
 # ==========================================
 def calculate_iou(box1, box2):
     x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
@@ -31,14 +31,13 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4, is_schematic=False):
     if not parts: return []
     
     # -----------------------------------------------------------
-    # [정렬 전략] 회로도와 실물을 다르게 처리
+    # [정렬 전략]
     # -----------------------------------------------------------
     if is_schematic:
-        # [회로도] "면적이 작은 순서"대로 정렬 (알맹이 우선)
-        # 이유: 작은 박스(심볼)를 먼저 살리고, 나중에 오는 큰 박스(글자 포함 껍데기)를 죽이기 위함
+        # [회로도] 면적이 '작은' 순서대로 정렬 (진짜 심볼부터 살리기)
         parts.sort(key=lambda x: (x['box'][2]-x['box'][0]) * (x['box'][3]-x['box'][1]))
     else:
-        # [실물] "점수(확신)가 높은 순서"대로 정렬 (V15 방식 유지)
+        # [실물] 신뢰도(conf) 순서대로 정렬
         parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
     final = []
@@ -53,42 +52,38 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4, is_schematic=False):
             y2 = min(curr['box'][3], k['box'][3])
             
             inter_area = max(0, x2-x1) * max(0, y2-y1)
-            
-            # k는 이미 등록된 박스 (회로도의 경우 '작은 알맹이')
-            # curr는 지금 검사하는 박스 (회로도의 경우 '큰 껍데기'일 가능성 높음)
             area_k = (k['box'][2]-k['box'][0]) * (k['box'][3]-k['box'][1])
+            area_curr = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
             
             # -----------------------------------------------------------
-            # [MODE A] 회로도 전용 (껍데기 제거)
+            # [MODE A] 회로도 전용 (껍데기 완전 제거)
             # -----------------------------------------------------------
             if is_schematic:
-                # 1. 포함 관계 검사:
-                # 이미 등록된 작은 박스(k)가 현재 박스(curr) 안에 80% 이상 포함되어 있다면?
-                # -> 현재 박스(curr)는 '글자가 포함된 불필요한 껍데기'이므로 제거!
-                overlap_ratio = inter_area / area_k if area_k > 0 else 0
+                # k: 이미 등록된 '작은 진짜 박스'
+                # curr: 지금 들어온 '큰 껍데기 후보'
                 
-                if overlap_ratio > 0.8:
-                    is_dup = True; break
-                
-                # 2. 같은 부품끼리 겹침 검사:
-                # 같은 이름인데 조금이라도 겹치거나 가까우면 제거 (중복 방지)
+                # 1. 같은 부품끼리 (예: 저항 vs 저항)
                 if curr['name'] == k['name']:
-                    iou = calculate_iou(curr['box'], k['box'])
-                    if iou > 0.01: 
+                    # [조건 A] 아주 조금이라도 겹치면(IoU > 0) -> 큰 놈 삭제
+                    if inter_area > 0:
                         is_dup = True; break
                     
+                    # [조건 B] 겹치지 않아도 거리가 가까우면(100px) -> 큰 놈 삭제 (텍스트 박스 등)
                     dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
-                    if dist < 60:
+                    if dist < 100:
                         is_dup = True; break
+                
+                # 2. 다른 부품이라도 (예: 저항 박스가 전원을 삼킴)
+                # 작은 박스(k)가 큰 박스(curr) 안에 50% 이상만 들어가도 큰 놈 삭제
+                overlap_ratio = inter_area / area_k if area_k > 0 else 0
+                if overlap_ratio > 0.5:
+                    is_dup = True; break
 
             # -----------------------------------------------------------
             # [MODE B] 실물 전용 (V15 로직 유지)
             # -----------------------------------------------------------
             else:
-                area_curr = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
                 min_area = min(area_curr, area_k)
-                
-                # 포함 비율
                 ratio = inter_area / min_area if min_area > 0 else 0
                 iou = calculate_iou(curr['box'], k['box'])
                 
@@ -110,7 +105,7 @@ def get_center(box):
 # [3. 회로도 분석]
 # ==========================================
 def analyze_schematic(img, model):
-    # 1%라도 감지되면 일단 다 가져옵니다.
+    # 1. 일단 1%라도 감지되면 다 가져옴
     res = model.predict(source=img, conf=0.01, verbose=False)
     
     raw = []
@@ -119,21 +114,37 @@ def analyze_schematic(img, model):
         raw_name = model.names[cls_id].lower()
         conf = float(b.conf[0])
         
+        # [핵심 수정] 'v' 라벨 인식 추가!
+        # 사용자님이 학습시킨 'V'를 'source'로 맵핑합니다.
+        name = raw_name
+        if raw_name == 'v':
+            name = 'source'
+        elif any(x in raw_name for x in ['volt', 'batt']): 
+            name = 'source'
+        elif 'cap' in raw_name: 
+            name = 'capacitor'
+        elif 'res' in raw_name: 
+            name = 'resistor'
+        elif 'ind' in raw_name: 
+            name = 'inductor'
+        elif 'dio' in raw_name: 
+            name = 'diode'
+        
         raw.append({
-            'name': raw_name, 
+            'name': name, # 변환된 이름 저장
             'box': b.xyxy[0].tolist(), 
             'center': get_center(b.xyxy[0].tolist()),
             'conf': conf
         })
     
-    # [핵심] V25 껍데기 제거 로직 적용
+    # [핵심] 껍데기 제거 로직 (작은 것 우선 + 근접 큰 박스 삭제)
     clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1, is_schematic=True)
     
-    # 전원 위치 보정
+    # 전원 위치 보정 (전원이 없을 경우에만)
     leftmost_idx = -1
     min_x = float('inf')
     
-    has_source = any(p['name'] in ['source', 'volt', 'batt'] for p in clean)
+    has_source = any(p['name'] == 'source' for p in clean)
     if not has_source and clean:
         for i, p in enumerate(clean):
             if p['center'][0] < min_x:
@@ -143,15 +154,9 @@ def analyze_schematic(img, model):
     summary_details = {}
     
     for i, p in enumerate(clean):
-        raw_name = p['name']
-        name = raw_name 
+        name = p['name']
         
-        if 'cap' in raw_name: name = 'capacitor'
-        elif 'res' in raw_name: name = 'resistor'
-        elif 'ind' in raw_name: name = 'inductor'
-        elif 'dio' in raw_name: name = 'diode'
-        elif any(x in raw_name for x in ['volt', 'batt', 'source']): name = 'source'
-
+        # 전원이 하나도 없어서 강제로 지정된 경우
         if i == leftmost_idx:
             name = 'source'
         
@@ -197,7 +202,7 @@ def analyze_real(img, model):
         else:
             bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 'is_on': False})
 
-    # 실물 중복 제거
+    # 실물 중복 제거 (V15 로직)
     clean_bodies = solve_overlap(bodies, dist_thresh=60, iou_thresh=0.3, is_schematic=False)
     
     # [연결 로직]
@@ -277,7 +282,7 @@ def analyze_real(img, model):
 # ==========================================
 # [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V25 (Shell Remover)")
+st.title("🧠 BrainBoard V26 ('V' Label & Shell Fix)")
 st.markdown("### 1. 부품 일치 여부")
 st.markdown("### 2. 연결 상태")
 
@@ -328,7 +333,7 @@ if ref_file and tgt_file:
             if c_ref != c_tgt:
                 mismatch_errors.append(f"⚠️ CAPACITOR 불일치: 회로도 {c_ref}개 vs 실물 {c_tgt}개")
             
-            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (껍데기 제거)", use_column_width=True)
+            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (껍데기 제거 + V 인식)", use_column_width=True)
             st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 분석 (OFF: {tgt_data['off']})", use_column_width=True)
             
             if mismatch_errors:
