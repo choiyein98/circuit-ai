@@ -8,7 +8,7 @@ from PIL import Image
 # ==========================================
 # [1. 설정 및 라이브러리]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V30 (Noise Filter)", layout="wide")
+st.set_page_config(page_title="BrainBoard V31 (Shell & Noise Fix)", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'
 MODEL_SYM_PATH = 'symbol.pt'
@@ -17,7 +17,7 @@ MODEL_SYM_PATH = 'symbol.pt'
 LEG_EXTENSION_RANGE = 180        
 
 # ==========================================
-# [2. 유틸리티 함수: 껍데기 제거 & 중복 처리]
+# [2. 유틸리티 함수: 껍데기 박멸 & 중복 제거]
 # ==========================================
 def calculate_iou(box1, box2):
     x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
@@ -31,19 +31,25 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4, is_schematic=False):
     if not parts: return []
     
     # -----------------------------------------------------------
-    # [정렬 전략]
+    # [정렬 전략] 회로도는 무조건 '작은 것' 우선
     # -----------------------------------------------------------
     if is_schematic:
-        # [회로도] 면적이 '작은' 순서대로 정렬 (유령 박스보다 진짜 심볼 우선)
+        # 면적이 작은 순서대로 정렬 (진짜 심볼은 작고, 텍스트 박스는 크기 때문)
         parts.sort(key=lambda x: (x['box'][2]-x['box'][0]) * (x['box'][3]-x['box'][1]))
     else:
-        # [실물] 신뢰도(conf) 높은 순서대로 정렬
+        # 실물은 신뢰도 높은 순
         parts.sort(key=lambda x: x.get('conf', 0), reverse=True)
     
     final = []
     for curr in parts:
+        # [회로도 전용 필터] 가로로 너무 긴 박스(글자) 제거
+        if is_schematic:
+            w = curr['box'][2] - curr['box'][0]
+            h = curr['box'][3] - curr['box'][1]
+            if h > 0 and (w / h) > 3.0: # 가로가 세로보다 3배 이상 길면 글자로 간주
+                continue 
+
         is_dup = False
-        
         for k in final:
             # 좌표 및 면적 계산
             x1 = max(curr['box'][0], k['box'][0])
@@ -52,31 +58,34 @@ def solve_overlap(parts, dist_thresh=0, iou_thresh=0.4, is_schematic=False):
             y2 = min(curr['box'][3], k['box'][3])
             
             inter_area = max(0, x2-x1) * max(0, y2-y1)
-            area_k = (k['box'][2]-k['box'][0]) * (k['box'][3]-k['box'][1])
             
             # -----------------------------------------------------------
-            # [MODE A] 회로도 전용 (겹침 & 껍데기 삭제)
+            # [MODE A] 회로도 전용 (작은 놈이 짱이다)
             # -----------------------------------------------------------
             if is_schematic:
-                # k: 이미 등록된 '작은 박스' (진짜 심볼)
-                # curr: 지금 검사하는 '큰 박스' (유령이거나 껍데기)
+                # k: 이미 살아남은 '작은 박스' (진짜)
+                # curr: 지금 검사하는 '큰 박스' (껍데기 후보)
                 
-                # 1. 겹침 발생 시 (IoU > 0)
+                # [조건 1] 겹침 발생 시 (조금이라도 닿으면 삭제)
                 if inter_area > 0:
-                    # 작은 박스(k)가 이미 있는데 큰 박스(curr)가 덮으려 하면 삭제
+                    # 작은 박스(k)가 이미 있는데, 큰 박스(curr)가 그 위를 덮거나 닿았다?
+                    # -> curr는 껍데기입니다. 삭제.
                     is_dup = True; break
                 
-                # 2. 거리 기반 삭제 (텍스트 박스 제거)
+                # [조건 2] 거리 기반 삭제 (텍스트 박스 제거)
+                # 겹치지 않아도 중심점이 100px 이내면 중복(설명 텍스트)으로 간주
                 dist = math.sqrt((curr['center'][0]-k['center'][0])**2 + (curr['center'][1]-k['center'][1])**2)
-                if dist < 80:
+                if dist < 100:
                     is_dup = True; break
 
             # -----------------------------------------------------------
-            # [MODE B] 실물 전용 (V15 로직)
+            # [MODE B] 실물 전용 (V15 로직 유지)
             # -----------------------------------------------------------
             else:
                 area_curr = (curr['box'][2]-curr['box'][0]) * (curr['box'][3]-curr['box'][1])
+                area_k = (k['box'][2]-k['box'][0]) * (k['box'][3]-k['box'][1])
                 min_area = min(area_curr, area_k)
+                
                 ratio = inter_area / min_area if min_area > 0 else 0
                 iou = calculate_iou(curr['box'], k['box'])
                 
@@ -98,9 +107,9 @@ def get_center(box):
 # [3. 회로도 분석]
 # ==========================================
 def analyze_schematic(img, model):
-    # [핵심 수정] 노이즈 제거를 위해 감도를 0.01 -> 0.25로 상향
-    # 이제 허공에 떠있는 흐릿한 박스들은 아예 감지되지 않습니다.
-    res = model.predict(source=img, conf=0.25, verbose=False)
+    # [핵심] 0.01로 아주 낮게 설정해서 일단 희미한 커패시터도 다 잡습니다.
+    # 그 후 solve_overlap에서 가짜(큰 박스)를 걸러냅니다.
+    res = model.predict(source=img, conf=0.01, verbose=False)
     
     raw = []
     for b in res[0].boxes:
@@ -110,8 +119,8 @@ def analyze_schematic(img, model):
         
         # 이름 매핑 ('v' -> 'source')
         name = raw_name
-        if raw_name == 'v':
-            name = 'source' # V는 source로 통일
+        if raw_name == 'v': 
+            name = 'source'
         elif any(x in raw_name for x in ['volt', 'batt', 'source']):
             name = 'source'
         elif 'cap' in raw_name: name = 'capacitor'
@@ -126,7 +135,7 @@ def analyze_schematic(img, model):
             'conf': conf
         })
     
-    # 중복 제거 (작은 박스 우선)
+    # [핵심] 껍데기 박멸 로직 실행
     clean = solve_overlap(raw, dist_thresh=0, iou_thresh=0.1, is_schematic=True)
     
     # 전원 위치 보정 (전원이 없을 때만)
@@ -150,7 +159,7 @@ def analyze_schematic(img, model):
         
         x1, y1, x2, y2 = map(int, p['box'])
         
-        # V(전원)는 파란색, 나머지는 빨간색
+        # 색상 설정 (V=파랑, 나머지=빨강)
         if name == 'source':
             box_color = (255, 0, 0) # Blue
             disp_name = "V"
@@ -182,10 +191,10 @@ def analyze_real(img, model):
         center = get_center(coords)
         conf = float(b.conf[0])
         
-        # [V15 민감도 유지]
-        if 'cap' in name: min_conf = 0.15
-        elif 'res' in name: min_conf = 0.60
-        elif 'wire' in name: min_conf = 0.15
+        # [V15 민감도]
+        if 'cap' in name: min_conf = 0.15      # 커패시터: 15% 
+        elif 'res' in name: min_conf = 0.60    # 저항: 60%
+        elif 'wire' in name: min_conf = 0.15   # 와이어: 15%
         else: min_conf = 0.25
             
         if conf < min_conf: continue
@@ -277,7 +286,7 @@ def analyze_real(img, model):
 # ==========================================
 # [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V30 (Noise Filter)")
+st.title("🧠 BrainBoard V31 (Shell & Noise Fix)")
 st.markdown("### 1. 부품 일치 여부")
 st.markdown("### 2. 연결 상태")
 
@@ -328,7 +337,7 @@ if ref_file and tgt_file:
             if c_ref != c_tgt:
                 mismatch_errors.append(f"⚠️ CAPACITOR 불일치: 회로도 {c_ref}개 vs 실물 {c_tgt}개")
             
-            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (노이즈 제거)", use_column_width=True)
+            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (껍데기 제거 + V 인식)", use_column_width=True)
             st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 분석 (OFF: {tgt_data['off']})", use_column_width=True)
             
             if mismatch_errors:
