@@ -8,7 +8,7 @@ from PIL import Image
 # ==========================================
 # [1. 설정 및 라이브러리]
 # ==========================================
-st.set_page_config(page_title="BrainBoard V35 (Topology Check)", layout="wide")
+st.set_page_config(page_title="BrainBoard V36 (Circuit Integrity)", layout="wide")
 
 MODEL_REAL_PATH = 'best.pt'
 MODEL_SYM_PATH = 'symbol.pt'
@@ -64,7 +64,7 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [3. 회로도 분석 (토폴로지 로직 추가)]
+# [3. 회로도 분석]
 # ==========================================
 def analyze_schematic(img, model):
     res = model.predict(source=img, conf=0.15, verbose=False)
@@ -91,9 +91,7 @@ def analyze_schematic(img, model):
     if not has_source and clean:
         min(clean, key=lambda p: p['center'][0])['name'] = 'source'
 
-    # -----------------------------------------------------------
-    # [NEW] 시작 부품 찾기 (Source와 가장 가까운 부품)
-    # -----------------------------------------------------------
+    # [핵심] 회로도의 '첫 번째 관문' 부품 찾기
     source_part = next((p for p in clean if p['name'] == 'source'), None)
     first_part_name = None
     
@@ -101,7 +99,6 @@ def analyze_schematic(img, model):
         min_dist = float('inf')
         for p in clean:
             if p['name'] == 'source': continue
-            # 소스 중심과 부품 중심 거리 계산
             d = math.sqrt((source_part['center'][0]-p['center'][0])**2 + (source_part['center'][1]-p['center'][1])**2)
             if d < min_dist:
                 min_dist = d
@@ -125,7 +122,7 @@ def analyze_schematic(img, model):
     return img, {'total': len(clean), 'details': summary_details, 'first_conn': first_part_name}
 
 # ==========================================
-# [4. 실물 분석 (토폴로지 로직 추가)]
+# [4. 실물 분석]
 # ==========================================
 def analyze_real(img, model):
     h, w, _ = img.shape
@@ -157,34 +154,29 @@ def analyze_real(img, model):
     clean_bodies = solve_overlap(bodies, dist_thresh=60, iou_thresh=0.3, is_schematic=False)
     
     # -----------------------------------------------------------
-    # [NEW] 실물 시작 부품 찾기 (전원선과 직접 연결된 부품)
+    # [NEW] 전원 직결 부품 식별 (회로 구조 분석용)
     # -----------------------------------------------------------
     power_rail_top = h * 0.2
     power_rail_bot = h * 0.8
     direct_power_components = set()
 
-    # 1. 전원 와이어 찾기
     power_wires = []
     for b in clean_bodies:
         if 'wire' in b['name']:
             if b['center'][1] < power_rail_top or b['center'][1] > power_rail_bot:
                 power_wires.append(b)
     
-    # 2. 전원 와이어와 가까운 부품 찾기
     for comp in clean_bodies:
         if 'wire' in comp['name']: continue
-        
-        # 전원 와이어와 가까우면 전원 직결 부품으로 간주
         for wire in power_wires:
             dist = math.sqrt((comp['center'][0]-wire['center'][0])**2 + (comp['center'][1]-wire['center'][1])**2)
-            if dist < 180: # 와이어 길이 고려한 거리
-                # 정규화된 이름으로 저장
+            if dist < 180: 
                 n_name = comp['name']
                 if 'res' in n_name: n_name = 'resistor'
                 elif 'cap' in n_name: n_name = 'capacitor'
                 direct_power_components.add(n_name)
 
-    # [기존 연결 로직]
+    # 연결 상태 확인 (기존 로직)
     power_active = False
     for b in clean_bodies:
         if 'wire' in b['name'] and b['center'][1] < h * 0.45:
@@ -249,8 +241,8 @@ def analyze_real(img, model):
 # ==========================================
 # [5. 메인 UI]
 # ==========================================
-st.title("🧠 BrainBoard V35: Topology Check")
-st.markdown("### 회로 구성(순서) 불일치 감지 기능 추가")
+st.title("🧠 BrainBoard V36: Circuit Integrity Check")
+st.markdown("### 회로도와 실물 회로가 '동일한 회로'인지 판별합니다.")
 
 @st.cache_resource
 def load_models():
@@ -258,6 +250,7 @@ def load_models():
 
 try:
     model_real, model_sym = load_models()
+    st.sidebar.success("✅ 모델 로드 성공")
 except Exception as e:
     st.error(f"모델 로드 실패: {e}")
     st.stop()
@@ -272,46 +265,48 @@ if ref_file and tgt_file:
     ref_cv = cv2.cvtColor(np.array(ref_image), cv2.COLOR_RGB2BGR)
     tgt_cv = cv2.cvtColor(np.array(tgt_image), cv2.COLOR_RGB2BGR)
 
-    if st.button("🚀 정밀 분석 실행"):
-        with st.spinner("AI 분석 중..."):
+    if st.button("🚀 정밀 검증 실행"):
+        with st.spinner("회로 구조 분석 중..."):
             res_ref_img, ref_data = analyze_schematic(ref_cv.copy(), model_sym)
             res_tgt_img, tgt_data = analyze_real(tgt_cv.copy(), model_real)
 
             st.divider()
             
-            # 1. 개수 비교
-            st.info("📊 **부품 인식 현황**")
+            # [결과 리포트]
             r_ref = ref_data['details'].get('resistor', 0)
             r_tgt = tgt_data['details'].get('resistor', 0)
             c_ref = ref_data['details'].get('capacitor', 0)
             c_tgt = tgt_data['details'].get('capacitor', 0)
             
-            st.write(f"- 저항: 회로도 {r_ref} vs 실물 {r_tgt}")
-            st.write(f"- 커패시터: 회로도 {c_ref} vs 실물 {c_tgt}")
-
-            # 2. [NEW] 토폴로지(연결 구조) 비교
-            st.subheader("🔗 연결 구조 진단")
+            # ------------------------------------------------------------------
+            # [NEW] 회로 일치성(Circuit Integrity) 판단 로직
+            # ------------------------------------------------------------------
+            st.subheader("⚡ 회로 구조 진단 (Circuit Integrity)")
             
-            expected_start = ref_data.get('first_conn') # 회로도에서 전원 바로 옆 부품
-            actual_starts = tgt_data.get('direct_conns', []) # 실물에서 전원선에 연결된 부품들
+            expected_start = ref_data.get('first_conn')
+            actual_starts = tgt_data.get('direct_conns', [])
+            
+            diff_circuit = False # 회로가 다른가?
 
-            topology_error = False
-            if expected_start:
-                # 회로도 시작 부품이 실물 전원 연결 목록에 없는 경우
-                # (예: 회로도는 저항 시작인데, 실물은 커패시터가 전원에 붙어있음)
-                if expected_start not in actual_starts and actual_starts:
-                    # 엄격한 검사: 실물 전원 연결 부품 중 예상된 부품이 하나도 없을 때
+            if expected_start and actual_starts:
+                if expected_start not in actual_starts:
+                    # 회로도의 첫 부품이 실물 전원부에 없음 -> 다른 회로임
+                    diff_circuit = True
+                    st.error(f"🚨 **회로 불일치 감지**: 회로도와 전혀 다른 회로입니다!")
+                    
                     if expected_start == 'resistor' and 'capacitor' in actual_starts:
-                        st.error(f"🚨 **치명적 오류**: 회로 순서가 다릅니다!")
-                        st.write(f"👉 회로도: 전원이 **저항(Resistor)**으로 먼저 들어갑니다.")
-                        st.write(f"👉 실물: 전원이 **커패시터(Capacitor)**에 직접 연결되었습니다.")
-                        topology_error = True
-                    elif expected_start == 'capacitor' and 'resistor' in actual_starts:
-                        st.error(f"🚨 **치명적 오류**: 회로 순서가 다릅니다! (예상: CAP, 실물: RES)")
-                        topology_error = True
-
-            if not topology_error:
-                st.success("✅ 회로 연결 순서가 논리적으로 일치합니다.")
+                        st.markdown("""
+                        **[진단 내용]**
+                        - **회로도 (Schematic):** 전원이 `저항(Resistor)`을 먼저 통과하여 전류를 제한합니다. 
+                        - **실물 (Real Board):** 전원이 `커패시터(Capacitor)`에 직접 연결되었습니다. 
+                        - **위험성:** 저항 없이 전원이 커패시터에 직결되면 **과전류(Inrush Current)**가 흘러 부품이 손상될 수 있습니다.
+                        """)
+                    else:
+                        st.write(f"👉 회로도 시작 부품: **{expected_start.upper()}**")
+                        st.write(f"👉 실물 전원 직결 부품: **{', '.join([x.upper() for x in actual_starts])}**")
+            
+            if not diff_circuit:
+                st.success("✅ 회로도와 실물 회로의 구조가 일치합니다.")
 
             st.divider()
             
@@ -320,11 +315,11 @@ if ref_file and tgt_file:
             if c_ref != c_tgt: mismatch.append("커패시터 개수 불일치")
             
             col_res1, col_res2 = st.columns(2)
-            col_res1.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption=f"회로도 (시작: {expected_start})", use_column_width=True)
-            col_res2.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 (전원직결: {actual_starts})", use_column_width=True)
+            col_res1.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption=f"회로도 (입력단: {expected_start})", use_column_width=True)
+            col_res2.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 (입력단: {actual_starts})", use_column_width=True)
 
             if mismatch:
-                st.error(f"❌ 개수 불일치: {', '.join(mismatch)}")
-            elif not topology_error and tgt_data['off'] == 0:
+                st.warning(f"⚠️ 부품 수량 차이: {', '.join(mismatch)}")
+            elif not diff_circuit and tgt_data['off'] == 0:
                 st.balloons()
-                st.success("🎉 완벽합니다! (개수 & 구조 일치)")
+                st.success("🎉 완벽합니다! (구조 일치 & 연결 성공)")
