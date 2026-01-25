@@ -6,20 +6,18 @@ import math
 from PIL import Image
 
 # ==========================================
-# [설정] BrainBoard V53+: Enhanced Logic
+# [설정] BrainBoard V56: Simple Visual
 # ==========================================
-st.set_page_config(page_title="BrainBoard V53+: Enhanced", layout="wide")
+st.set_page_config(page_title="BrainBoard V56", layout="wide")
 
-# [기존 설정 유지]
+# [모델 설정]
 REAL_MODEL_PATHS = ['best.pt', 'best(2).pt', 'best(3).pt']
 MODEL_SYM_PATH = 'symbol.pt'
 LEG_EXTENSION_RANGE = 180
-
-# [추가된 설정: 검증 임계값]
-SHORT_CIRCUIT_IOU = 0.6  # 이 이상 겹치면 합선(Short)으로 간주
+SHORT_CIRCUIT_IOU = 0.6  # 합선 판단 기준
 
 # ==========================================
-# [Helper Functions] 공통 함수 (유지)
+# [Helper Functions] 공통 함수
 # ==========================================
 def calculate_iou(box1, box2):
     x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
@@ -33,7 +31,7 @@ def get_center(box):
     return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
 # ==========================================
-# [중복 제거 1] V48 스타일 (유지)
+# [중복 제거 1] V48 스타일 (회로도용)
 # ==========================================
 def solve_overlap_schematic_v48(parts, distance_threshold=80):
     if not parts: return []
@@ -52,7 +50,7 @@ def solve_overlap_schematic_v48(parts, distance_threshold=80):
     return final_parts
 
 # ==========================================
-# [중복 제거 2] V35 스타일 (유지)
+# [중복 제거 2] V35 스타일 (실물용)
 # ==========================================
 def solve_overlap_real_v35(parts, dist_thresh=60, iou_thresh=0.4):
     if not parts: return []
@@ -79,7 +77,7 @@ def solve_overlap_real_v35(parts, dist_thresh=60, iou_thresh=0.4):
     return final
 
 # ==========================================
-# [분석 1] 회로도 (유지)
+# [분석 1] 회로도 분석
 # ==========================================
 def analyze_schematic(img, model):
     results = model.predict(source=img, save=False, conf=0.05, verbose=False)
@@ -116,14 +114,14 @@ def analyze_schematic(img, model):
     return img, summary
 
 # ==========================================
-# [분석 2] 실물 보드 (조건 추가됨)
+# [분석 2] 실물 보드 분석 (색상 조건 수정됨)
 # ==========================================
 def analyze_real_ensemble(img, model_list):
     h, w, _ = img.shape
     raw_bodies = []
     raw_pins = [] 
     
-    # 1. 앙상블 탐지 (기존 코드 유지)
+    # 1. 앙상블 탐지
     for model in model_list:
         res = model.predict(source=img, conf=0.10, verbose=False)
         boxes = res[0].boxes
@@ -143,14 +141,13 @@ def analyze_real_ensemble(img, model_list):
             elif 'breadboard' in name:
                 continue
             else:
-                # [수정] 상태 필드에 'is_short', 'check_polar' 추가
                 raw_bodies.append({'name': name, 'box': coords, 'center': center, 'conf': conf, 
-                                   'is_on': False, 'is_short': False, 'check_polar': False})
+                                   'is_on': False, 'is_short': False})
 
-    # 2. 중복 제거 (기존 코드 유지)
+    # 2. 중복 제거
     clean_bodies = solve_overlap_real_v35(raw_bodies, dist_thresh=60, iou_thresh=0.4)
     
-    # 3. 연결 로직 (기존 코드 유지)
+    # 3. 연결 로직 (V35 Logic)
     power_active = False
     for b in clean_bodies:
         if 'wire' in b['name'] and b['center'][1] < h * 0.45:
@@ -181,36 +178,23 @@ def analyze_real_ensemble(img, model_list):
                     dist = math.sqrt((cx - ocx)**2 + (cy - ocy)**2)
                     if dist < LEG_EXTENSION_RANGE * 1.5: comp['is_on'] = True; break
 
-    # ==========================================================
-    # [추가된 조건 1] 회로 이론 검증: 쇼트(Short) 감지
-    # ==========================================================
-    # 부품들이 물리적으로 과도하게 겹쳐 있으면 단락(Short) 위험으로 간주
+    # 4. 쇼트(Short) 감지 - 회로 이론
     for i, c1 in enumerate(clean_bodies):
-        if 'wire' in c1['name']: continue # 전선끼리는 겹칠 수 있음
+        if 'wire' in c1['name']: continue
         for j, c2 in enumerate(clean_bodies):
             if i >= j: continue
             if 'wire' in c2['name']: continue
-            
             overlap_ratio = calculate_iou(c1['box'], c2['box'])
             if overlap_ratio > SHORT_CIRCUIT_IOU:
                 c1['is_short'] = True
                 c2['is_short'] = True
 
-    # ==========================================================
-    # [추가된 조건 2] 부품 검증: 극성(Polarity) 확인 필요 부품 식별
-    # ==========================================================
-    for comp in clean_bodies:
-        # 커패시터나 LED(다이오드)는 극성 확인이 필수
-        if 'cap' in comp['name'] or 'led' in comp['name'] or 'dio' in comp['name']:
-            comp['check_polar'] = True
-
-    # 결과 요약 및 그리기
+    # 5. 결과 시각화
     summary = {'total': 0, 'on': 0, 'off': 0, 'short': 0, 'details': {}}
     
     for comp in clean_bodies:
         is_on = comp['is_on']
         is_short = comp['is_short']
-        check_polar = comp['check_polar']
         raw_name = comp['name']
         
         norm_name = raw_name
@@ -224,22 +208,18 @@ def analyze_real_ensemble(img, model_list):
             if norm_name not in summary['details']: summary['details'][norm_name] = {'count': 0}
             summary['details'][norm_name]['count'] += 1
 
-        # [상태별 시각화 로직 수정]
+        # [수정된 부분] 상태별 시각화 로직: 연결되면 무조건 초록색
         if is_short:
-            color = (0, 0, 255)    # Red (위험)
-            status_text = "SHORT!" # 합선 경고
+            color = (0, 0, 255)    # Red (합선은 위험하므로 빨강 유지)
+            status_text = "SHORT!" 
             summary['short'] += 1
             summary['off'] += 1
         elif is_on:
             summary['on'] += 1
-            if check_polar:
-                color = (0, 255, 255) # Yellow (주의)
-                status_text = "ON(Polar?)" # 연결은 됐으나 극성 확인 필요
-            else:
-                color = (0, 255, 0)   # Green (정상)
-                status_text = "ON"
+            color = (0, 255, 0)   # Green (무조건 초록색)
+            status_text = "ON"    # 텍스트도 깔끔하게 통일
         else:
-            color = (0, 0, 255) # Red (끊김)
+            color = (0, 0, 255)   # Red (연결 안됨)
             status_text = "OFF"
             summary['off'] += 1
         
@@ -247,7 +227,6 @@ def analyze_real_ensemble(img, model_list):
         
         x1, y1, x2, y2 = map(int, comp['box'])
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
-        # 텍스트에 엔지니어링 상태 반영
         cv2.putText(img, f"{label_name}:{status_text}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
     return img, summary
@@ -255,11 +234,11 @@ def analyze_real_ensemble(img, model_list):
 # ==========================================
 # [Main UI]
 # ==========================================
-st.title("🧠 BrainBoard V53+: Enhanced Logic")
+st.title("🧠 BrainBoard V56: Safety & Simple")
 st.markdown("""
-### 업데이트 내역
-1.  **회로 검증 강화**: 부품 간 충돌(Short) 감지 기능 추가 
-2.  **부품 검증 강화**: 커패시터/LED 등 유극성 부품에 대한 "Polarity Check" 경고 추가
+### ✅ 시스템 특징
+- **시각화**: 연결 확인 시 **무조건 초록색(ON)**으로 표시하여 혼동 방지
+- **안전 검증**: 부품이 겹쳐 합선(Short) 위험이 있을 경우에만 **빨간색(SHORT)** 경고
 """)
 
 @st.cache_resource
@@ -287,14 +266,13 @@ if ref_file and tgt_file:
     ref_cv = cv2.cvtColor(np.array(Image.open(ref_file)), cv2.COLOR_RGB2BGR)
     tgt_cv = cv2.cvtColor(np.array(Image.open(tgt_file)), cv2.COLOR_RGB2BGR)
 
-    if st.button("🚀 정밀 검증 실행"):
+    if st.button("🚀 검증 실행"):
         res_ref, ref_data = analyze_schematic(ref_cv.copy(), model_sym)
         res_tgt, tgt_data = analyze_real_ensemble(tgt_cv.copy(), models_real)
         
         st.divider()
-        st.subheader("📊 검증 리포트")
+        st.subheader("📊 검증 결과")
 
-        # 1. 개수 비교
         all_keys = set(ref_data['details'].keys()) | set(tgt_data['details'].keys())
         match_all = True
         for k in all_keys:
@@ -308,15 +286,14 @@ if ref_file and tgt_file:
                 match_all = False
                 st.error(f"⚠️ {k.upper()}: 수량 불일치 (회로도 {r_cnt} vs 실물 {t_cnt})")
 
-        # 2. 회로 상태 경고
         if tgt_data['short'] > 0:
-            st.error(f"🚨 **치명적 오류**: {tgt_data['short']}개의 부품이 합선(SHORT) 위험이 있습니다. 위치를 확인하세요.")
+            st.error(f"🚨 **합선 경고**: {tgt_data['short']}개의 부품이 겹쳐 있어 위험합니다.")
         elif tgt_data['off'] > 0:
-            st.warning(f"⚠️ **연결 확인 필요**: {tgt_data['off']}개의 부품이 연결되지 않았거나 극성 확인이 필요합니다.")
+            st.warning(f"⚠️ **연결 끊김**: {tgt_data['off']}개의 부품이 전원에 연결되지 않았습니다.")
         elif match_all:
             st.balloons()
-            st.success("🎉 회로 구성이 완벽합니다!")
+            st.success("🎉 모든 연결이 정상입니다 (ALL GREEN)!")
 
         col_r1, col_r2 = st.columns(2)
         with col_r1: st.image(cv2.cvtColor(res_ref, cv2.COLOR_BGR2RGB), caption="회로도", use_column_width=True)
-        with col_r2: st.image(cv2.cvtColor(res_tgt, cv2.COLOR_BGR2RGB), caption="실물 검증 (Enhanced)", use_column_width=True)
+        with col_r2: st.image(cv2.cvtColor(res_tgt, cv2.COLOR_BGR2RGB), caption="실물 검증", use_column_width=True)
