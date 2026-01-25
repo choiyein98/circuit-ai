@@ -9,19 +9,21 @@ import gc
 from datetime import datetime
 
 # ==========================================
-# [설정] CircuitMate AI (V70: Design & History)
+# [설정] CircuitMate AI V71: History Recall
 # ==========================================
 st.set_page_config(page_title="CircuitMate AI", layout="wide", page_icon="⚡")
 
-# [세션 상태 초기화] 히스토리 저장을 위한 메모리 공간
+# [세션 상태 초기화]
 if 'history' not in st.session_state:
     st.session_state['history'] = []
+if 'active_result' not in st.session_state:
+    st.session_state['active_result'] = None  # 현재 화면에 보여줄 데이터
 
 REAL_MODEL_PATH = 'best(3).pt' 
 MODEL_SYM_PATH = 'symbol.pt'
 
 # ==========================================
-# [Core Logic] V69의 완벽한 알고리즘 (변경 없음)
+# [Core Logic] 기존 V69/V70 로직 (변경 없음)
 # ==========================================
 def resize_image_smart(image, max_size=1024):
     h, w = image.shape[:2]
@@ -177,16 +179,63 @@ def analyze_real(img, model):
     return img, {'parts': sorted_parts}
 
 # ==========================================
+# [Renderer] 분석 결과를 화면에 그려주는 함수
+# ==========================================
+def render_result(result_data):
+    """저장된 분석 데이터를 화면에 출력하는 함수"""
+    
+    st.divider()
+    st.markdown("## 📊 분석 결과 리포트")
+
+    bom_match = result_data['bom_match']
+    is_seq_match = result_data['is_seq_match']
+    bom_data = result_data['bom_data']
+    ref_list = result_data['ref_list']
+    tgt_list = result_data['tgt_list']
+    
+    col_res1, col_res2 = st.columns([1, 1])
+    
+    with col_res1:
+        st.markdown("### 📋 부품 목록 확인")
+        st.dataframe(bom_data, hide_index=True)
+
+    with col_res2:
+        st.markdown("### 🔗 연결 순서 검증")
+        if not bom_match:
+            st.warning("⚠️ 부품 개수가 달라서 정확한 순서 비교가 어렵습니다.")
+            st.caption(f"회로도: {' → '.join(ref_list)}")
+            st.caption(f"실물: {' → '.join(tgt_list)}")
+        else:
+            for i in range(len(ref_list)):
+                r_item = ref_list[i]
+                t_item = tgt_list[i]
+                if r_item == t_item:
+                    st.info(f"**Step {i+1}:** {r_item.upper()} ✅ 정상 연결됨")
+                else:
+                    st.error(f"**Step {i+1}:** 불일치 감지! (회로도: {r_item} vs 실물: {t_item})")
+            
+            if is_seq_match:
+                st.success("완벽합니다! 회로 연결 순서가 정확해요. 🎉")
+                st.balloons()
+
+    st.markdown("### 📷 AI 인식 화면")
+    img_col1, img_col2 = st.columns(2)
+    with img_col1:
+        st.image(result_data['res_ref_img'], caption="회로도 분석 (번호는 전류 흐름 순서)", use_column_width=True)
+    with img_col2:
+        st.image(result_data['res_tgt_img'], caption="실물 분석 (번호는 배치 순서)", use_column_width=True)
+
+
+# ==========================================
 # [UI/UX] Sidebar & Main Layout
 # ==========================================
 
-# [사이드바] 모델 로드 및 히스토리 기능
+# [사이드바]
 with st.sidebar:
     st.title("⚡ CircuitMate AI")
     st.caption("Your Personal Circuit Assistant")
     st.divider()
     
-    # 모델 로드 상태
     try:
         if 'models_loaded' not in st.session_state:
             gc.collect()
@@ -199,18 +248,20 @@ with st.sidebar:
         st.stop()
 
     st.divider()
-    
-    # [히스토리 기능] ChatGPT 스타일 기록
     st.markdown("### 🕒 최근 검증 기록")
-    if len(st.session_state['history']) == 0:
-        st.caption("아직 검증 기록이 없습니다.")
+    
+    # 히스토리 버튼 생성 (ChatGPT 스타일)
+    if not st.session_state['history']:
+        st.caption("아직 기록이 없습니다.")
     else:
-        # 최신순으로 보여주기
+        # 최신순으로 정렬
         for idx, item in enumerate(reversed(st.session_state['history'])):
-            with st.expander(f"{item['time']} - {item['status']}"):
-                st.write(item['detail'])
+            # 고유한 key를 위해 idx 사용
+            btn_label = f"{item['time']} - {item['status']}"
+            if st.button(btn_label, key=f"hist_{idx}", use_container_width=True):
+                st.session_state['active_result'] = item # 클릭 시 해당 결과 활성화
 
-# [메인 화면] 대화형 UI 구성
+# [메인 화면]
 st.markdown("""
 # 👋 안녕하세요! 회로 검증을 도와드릴게요.
 회로도와 실물 브레드보드 사진을 업로드해주시면, **부품의 종류와 연결 순서**를 꼼꼼하게 비교해드립니다.
@@ -227,6 +278,7 @@ with col2:
 
 # 분석 로직
 if ref_file and tgt_file:
+    # 파일이 새로 올라오면 이미지 로드
     ref_image = Image.open(ref_file)
     tgt_image = Image.open(tgt_file)
     ref_cv = cv2.cvtColor(np.array(ref_image), cv2.COLOR_RGB2BGR)
@@ -234,25 +286,16 @@ if ref_file and tgt_file:
 
     if st.button("✨ 분석 시작하기 (Analyze)", type="primary"):
         gc.collect()
-        
-        # 진행 상황 표시
         progress_text = "AI가 회로를 분석하고 있습니다... 잠시만 기다려주세요!"
         my_bar = st.progress(0, text=progress_text)
 
-        # 분석 실행
+        # 1. 분석 실행
         res_ref_img, ref_data = analyze_schematic(ref_cv.copy(), st.session_state['model_sym'])
         my_bar.progress(50, text="실물 보드의 부품을 인식하고 있습니다...")
-        
         res_tgt_img, tgt_data = analyze_real(tgt_cv.copy(), st.session_state['model_real'])
-        my_bar.progress(90, text="회로도와 실물을 비교 검증 중입니다...")
+        my_bar.progress(90, text="검증 데이터를 정리 중입니다...")
 
-        # --------------------------------------------------------
-        # 결과 리포트 생성
-        # --------------------------------------------------------
-        st.divider()
-        st.markdown("## 📊 분석 결과 리포트")
-
-        # 1. BOM 비교
+        # 2. 데이터 가공
         ref_counts = defaultdict(int)
         tgt_counts = defaultdict(int)
         for p in ref_data['parts']: ref_counts[p['name']] += 1
@@ -268,65 +311,42 @@ if ref_file and tgt_file:
             status = "✅ 일치" if r == t else "⚠️ 확인 필요"
             bom_data.append({"부품명": k.upper(), "회로도 개수": r, "실물 개수": t, "상태": status})
             if r != t: bom_match = False
-        
-        col_res1, col_res2 = st.columns([1, 1])
-        
-        with col_res1:
-            st.markdown("### 📋 부품 목록 확인")
-            st.dataframe(bom_data, hide_index=True)
-
-        # 2. 순서 비교
+            
         ref_list = [p['name'] for p in ref_data['parts']]
         tgt_list = [p['name'] for p in tgt_data['parts']]
         
         is_seq_match = True
-        
-        with col_res2:
-            st.markdown("### 🔗 연결 순서 검증")
-            if not bom_match:
-                st.warning("⚠️ 부품 개수가 달라서 정확한 순서 비교가 어렵습니다.")
-                st.caption(f"회로도: {' → '.join(ref_list)}")
-                st.caption(f"실물: {' → '.join(tgt_list)}")
-            else:
-                for i in range(len(ref_list)):
-                    r_item = ref_list[i]
-                    t_item = tgt_list[i]
-                    if r_item == t_item:
-                        st.info(f"**Step {i+1}:** {r_item.upper()} ✅ 정상 연결됨")
-                    else:
-                        st.error(f"**Step {i+1}:** 불일치 감지! (회로도: {r_item} vs 실물: {t_item})")
-                        is_seq_match = False
-                
-                if is_seq_match:
-                    st.success("완벽합니다! 회로 연결 순서가 정확해요. 🎉")
-                    st.balloons()
+        if not bom_match:
+            is_seq_match = False
+        else:
+            for i in range(len(ref_list)):
+                if ref_list[i] != tgt_list[i]: is_seq_match = False
 
-        my_bar.empty() # 진행바 제거
-
-        # 3. 시각화 이미지
-        st.markdown("### 📷 AI 인식 화면")
-        img_col1, img_col2 = st.columns(2)
-        with img_col1:
-            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (번호는 전류 흐름 순서)", use_column_width=True)
-        with img_col2:
-            st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption="실물 분석 (번호는 배치 순서)", use_column_width=True)
-
-        # --------------------------------------------------------
-        # [히스토리 저장]
-        # --------------------------------------------------------
+        # 3. 결과 딕셔너리 생성 (저장용)
         timestamp = datetime.now().strftime("%H:%M:%S")
         status_msg = "성공 ✅" if (bom_match and is_seq_match) else "실패 ❌"
         
-        # 히스토리 요약 텍스트 생성
-        detail_txt = f"부품: {'일치' if bom_match else '불일치'} / 순서: {'일치' if is_seq_match else '불일치'}"
-        
-        # 세션에 추가
-        st.session_state['history'].append({
+        result_packet = {
             "time": timestamp,
             "status": status_msg,
-            "detail": detail_txt
-        })
+            "bom_match": bom_match,
+            "is_seq_match": is_seq_match,
+            "bom_data": bom_data,
+            "ref_list": ref_list,
+            "tgt_list": tgt_list,
+            # 이미지를 RGB로 변환하여 저장 (출력용)
+            "res_ref_img": cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB),
+            "res_tgt_img": cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB)
+        }
+
+        # 4. 세션에 저장 및 활성화
+        st.session_state['history'].append(result_packet)
+        st.session_state['active_result'] = result_packet
         
-        # 메모리 정리
-        del res_ref_img, res_tgt_img
+        my_bar.empty()
         gc.collect()
+
+# [결과 화면 렌더링]
+# active_result에 데이터가 있으면 화면에 표시 (방금 분석했거나, 히스토리에서 클릭했거나)
+if st.session_state['active_result']:
+    render_result(st.session_state['active_result'])
