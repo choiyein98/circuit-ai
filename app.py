@@ -6,17 +6,22 @@ import math
 from PIL import Image
 from collections import defaultdict
 import gc
+from datetime import datetime
 
 # ==========================================
-# [설정] BrainBoard V69: The Final Perfected
+# [설정] CircuitMate AI (V70: Design & History)
 # ==========================================
-st.set_page_config(page_title="BrainBoard V69: Final", layout="wide")
+st.set_page_config(page_title="CircuitMate AI", layout="wide", page_icon="⚡")
+
+# [세션 상태 초기화] 히스토리 저장을 위한 메모리 공간
+if 'history' not in st.session_state:
+    st.session_state['history'] = []
 
 REAL_MODEL_PATH = 'best(3).pt' 
 MODEL_SYM_PATH = 'symbol.pt'
 
 # ==========================================
-# [Helper Functions]
+# [Core Logic] V69의 완벽한 알고리즘 (변경 없음)
 # ==========================================
 def resize_image_smart(image, max_size=1024):
     h, w = image.shape[:2]
@@ -59,19 +64,11 @@ def solve_overlap_real(parts):
         if not is_dup: final.append(curr)
     return final
 
-# ==========================================
-# [Logic] 엄격한 순서 정렬 (좌->우, 상->하)
-# ==========================================
 def sort_parts_LRTB(parts, image_width):
     if not parts: return []
-    
-    # 1. X축 정렬
     parts.sort(key=lambda x: x['center'][0])
-    
     sorted_sequence = []
     current_column = []
-    
-    # 같은 세로줄로 묶는 기준 (너비의 10%)
     X_THRESHOLD = image_width * 0.10
     
     current_column.append(parts[0])
@@ -80,38 +77,28 @@ def sort_parts_LRTB(parts, image_width):
     for i in range(1, len(parts)):
         curr = parts[i]
         curr_x = curr['center'][0]
-        
         if abs(curr_x - ref_x) < X_THRESHOLD:
             current_column.append(curr)
         else:
-            # 컬럼 내에서는 Y축(위->아래) 정렬
             current_column.sort(key=lambda x: x['center'][1])
             sorted_sequence.extend(current_column)
-            
             current_column = [curr]
             ref_x = curr_x
             
     if current_column:
         current_column.sort(key=lambda x: x['center'][1])
         sorted_sequence.extend(current_column)
-        
     return sorted_sequence
 
-# ==========================================
-# [Analysis 1] Schematic
-# ==========================================
 def analyze_schematic(img, model):
     img = resize_image_smart(img)
     w = img.shape[1]
-    
     results = model.predict(source=img, save=False, conf=0.05, verbose=False)
     raw_parts = []
-    
     for box in results[0].boxes:
         raw_name = model.names[int(box.cls[0])]
         norm_name = normalize_name(raw_name)
         if norm_name == 'wire' or norm_name == 'leg': continue
-        
         coords = box.xyxy[0].tolist()
         raw_parts.append({'name': norm_name, 'box': coords, 'center': get_center(coords), 'conf': float(box.conf[0])})
 
@@ -124,15 +111,12 @@ def analyze_schematic(img, model):
          leftmost = min(parts, key=lambda p: p['center'][0])
          leftmost['name'] = 'source'
 
-    # 시각화 및 정렬
     for p in parts:
         x1, y1, x2, y2 = map(int, p['box'])
         cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
         cv2.putText(img, p['name'], (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
     sorted_parts = sort_parts_LRTB(parts, w)
-    
-    # 번호 표시
     for i, p in enumerate(sorted_parts):
         cx, cy = map(int, p['center'])
         cv2.circle(img, (cx, cy), 15, (0, 0, 255), -1)
@@ -140,27 +124,18 @@ def analyze_schematic(img, model):
 
     return img, {'parts': sorted_parts}
 
-# ==========================================
-# [Analysis 2] Real Board (인식 기능 완벽 유지)
-# ==========================================
 def analyze_real(img, model):
     img = resize_image_smart(img)
     h, w, _ = img.shape
-    
-    # 1. 강력한 인식 (Threshold 유지)
     res = model.predict(source=img, conf=0.10, verbose=False)
     raw_objects = []
-    
     for b in res[0].boxes:
         raw_name = model.names[int(b.cls[0])]
         norm_name = normalize_name(raw_name)
         conf = float(b.conf[0])
-        
-        # [중요] V67의 필터링 로직 그대로 유지
         if norm_name == 'capacitor' and conf < 0.20: continue
         if norm_name == 'resistor' and conf < 0.25: continue
         if 'breadboard' in raw_name: continue
-        
         coords = b.xyxy[0].tolist()
         raw_objects.append({'name': norm_name, 'box': coords, 'center': get_center(coords), 'conf': conf})
 
@@ -168,26 +143,21 @@ def analyze_real(img, model):
     legs = [p for p in raw_objects if p['name'] == 'leg']
     parts = solve_overlap_real(parts_candidates)
 
-    # 2. Source 복구 로직 (그대로 유지)
     TOP_RAIL = h * 0.20; BOTTOM_RAIL = h * 0.80
     has_source = False
-    
     if any(p['name'] == 'source' for p in parts): has_source = True
     if not has_source:
         for p in raw_objects:
             if p['center'][1] < TOP_RAIL or p['center'][1] > BOTTOM_RAIL:
                 if p['name'] == 'wire' or p['name'] == 'leg':
                     has_source = True; break
-    
     if has_source and not any(p['name'] == 'source' for p in parts):
         parts.append({'name': 'source', 'box': [0,0,0,0], 'center': (0,0), 'conf': 1.0})
 
-    # 3. 시각화
     for p in parts:
         if p['name'] == 'wire': continue
         color = (0, 255, 0)
         if p['name'] == 'source': color = (0, 255, 255)
-        
         if p['box'][2] > 0:
             x1, y1, x2, y2 = map(int, p['box'])
             cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
@@ -195,7 +165,6 @@ def analyze_real(img, model):
         elif p['name'] == 'source':
             cv2.putText(img, "SOURCE DETECTED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-    # 4. 정렬 (와이어 제외하고 부품만 줄세우기)
     main_parts = [p for p in parts if p['name'] != 'wire']
     sorted_parts = sort_parts_LRTB(main_parts, w)
 
@@ -208,85 +177,156 @@ def analyze_real(img, model):
     return img, {'parts': sorted_parts}
 
 # ==========================================
-# [Main UI]
+# [UI/UX] Sidebar & Main Layout
 # ==========================================
-st.title("🧠 BrainBoard V69: Perfected System")
-st.markdown("### ⚡ 부품 인식(완벽) + 순서 비교(정밀)")
 
-@st.cache_resource
-def load_models():
-    gc.collect()
-    return YOLO(REAL_MODEL_PATH), YOLO(MODEL_SYM_PATH)
+# [사이드바] 모델 로드 및 히스토리 기능
+with st.sidebar:
+    st.title("⚡ CircuitMate AI")
+    st.caption("Your Personal Circuit Assistant")
+    st.divider()
+    
+    # 모델 로드 상태
+    try:
+        if 'models_loaded' not in st.session_state:
+            gc.collect()
+            st.session_state['model_real'] = YOLO(REAL_MODEL_PATH)
+            st.session_state['model_sym'] = YOLO(MODEL_SYM_PATH)
+            st.session_state['models_loaded'] = True
+        st.success("✅ 시스템 준비 완료")
+    except Exception as e:
+        st.error(f"시스템 오류: {e}")
+        st.stop()
 
-try:
-    model_real, model_sym = load_models()
-    st.sidebar.success("✅ 시스템 준비 완료")
-except: st.stop()
+    st.divider()
+    
+    # [히스토리 기능] ChatGPT 스타일 기록
+    st.markdown("### 🕒 최근 검증 기록")
+    if len(st.session_state['history']) == 0:
+        st.caption("아직 검증 기록이 없습니다.")
+    else:
+        # 최신순으로 보여주기
+        for idx, item in enumerate(reversed(st.session_state['history'])):
+            with st.expander(f"{item['time']} - {item['status']}"):
+                st.write(item['detail'])
+
+# [메인 화면] 대화형 UI 구성
+st.markdown("""
+# 👋 안녕하세요! 회로 검증을 도와드릴게요.
+회로도와 실물 브레드보드 사진을 업로드해주시면, **부품의 종류와 연결 순서**를 꼼꼼하게 비교해드립니다.
+""")
 
 col1, col2 = st.columns(2)
-ref_file = col1.file_uploader("1. 회로도", type=['jpg', 'png', 'jpeg'])
-tgt_file = col2.file_uploader("2. 실물 사진", type=['jpg', 'png', 'jpeg'])
+with col1:
+    st.markdown("### 1️⃣ 회로도 (Schematic)")
+    ref_file = st.file_uploader("회로도 이미지를 넣어주세요", type=['jpg', 'png', 'jpeg'])
 
+with col2:
+    st.markdown("### 2️⃣ 실물 사진 (Real Board)")
+    tgt_file = st.file_uploader("브레드보드 사진을 넣어주세요", type=['jpg', 'png', 'jpeg'])
+
+# 분석 로직
 if ref_file and tgt_file:
     ref_image = Image.open(ref_file)
     tgt_image = Image.open(tgt_file)
     ref_cv = cv2.cvtColor(np.array(ref_image), cv2.COLOR_RGB2BGR)
     tgt_cv = cv2.cvtColor(np.array(tgt_image), cv2.COLOR_RGB2BGR)
 
-    if st.button("🚀 분석 실행"):
+    if st.button("✨ 분석 시작하기 (Analyze)", type="primary"):
         gc.collect()
-        with st.spinner("모든 부품을 인식하고 순서를 비교합니다..."):
-            
-            res_ref_img, ref_data = analyze_schematic(ref_cv.copy(), model_sym)
-            res_tgt_img, tgt_data = analyze_real(tgt_cv.copy(), model_real)
+        
+        # 진행 상황 표시
+        progress_text = "AI가 회로를 분석하고 있습니다... 잠시만 기다려주세요!"
+        my_bar = st.progress(0, text=progress_text)
 
-            # 1. BOM Check
-            st.subheader("1. 부품 개수 확인")
-            ref_counts = defaultdict(int)
-            tgt_counts = defaultdict(int)
-            for p in ref_data['parts']: ref_counts[p['name']] += 1
-            for p in tgt_data['parts']: tgt_counts[p['name']] += 1
-            
-            all_keys = set(ref_counts.keys()) | set(tgt_counts.keys())
-            bom_match = True
-            bom_data = []
-            
-            for k in all_keys:
-                if k == 'wire': continue
-                r = ref_counts[k]; t = tgt_counts[k]
-                status = "✅ 일치" if r == t else "❌ 불일치"
-                bom_data.append({"부품명": k.upper(), "회로도": r, "실물": t, "상태": status})
-                if r != t: bom_match = False
-            st.table(bom_data)
+        # 분석 실행
+        res_ref_img, ref_data = analyze_schematic(ref_cv.copy(), st.session_state['model_sym'])
+        my_bar.progress(50, text="실물 보드의 부품을 인식하고 있습니다...")
+        
+        res_tgt_img, tgt_data = analyze_real(tgt_cv.copy(), st.session_state['model_real'])
+        my_bar.progress(90, text="회로도와 실물을 비교 검증 중입니다...")
 
-            # 2. Strict Sequence Check
-            st.subheader("2. 배치 순서 비교 (Left→Right & Top→Bottom)")
-            
-            ref_list = [p['name'] for p in ref_data['parts']]
-            tgt_list = [p['name'] for p in tgt_data['parts']]
-            
-            st.code(f"📜 회로도: {' → '.join(ref_list)}")
-            st.code(f"📸 실물:   {' → '.join(tgt_list)}")
-            
+        # --------------------------------------------------------
+        # 결과 리포트 생성
+        # --------------------------------------------------------
+        st.divider()
+        st.markdown("## 📊 분석 결과 리포트")
+
+        # 1. BOM 비교
+        ref_counts = defaultdict(int)
+        tgt_counts = defaultdict(int)
+        for p in ref_data['parts']: ref_counts[p['name']] += 1
+        for p in tgt_data['parts']: tgt_counts[p['name']] += 1
+        
+        all_keys = set(ref_counts.keys()) | set(tgt_counts.keys())
+        bom_match = True
+        bom_data = []
+        
+        for k in all_keys:
+            if k == 'wire': continue
+            r = ref_counts[k]; t = tgt_counts[k]
+            status = "✅ 일치" if r == t else "⚠️ 확인 필요"
+            bom_data.append({"부품명": k.upper(), "회로도 개수": r, "실물 개수": t, "상태": status})
+            if r != t: bom_match = False
+        
+        col_res1, col_res2 = st.columns([1, 1])
+        
+        with col_res1:
+            st.markdown("### 📋 부품 목록 확인")
+            st.dataframe(bom_data, hide_index=True)
+
+        # 2. 순서 비교
+        ref_list = [p['name'] for p in ref_data['parts']]
+        tgt_list = [p['name'] for p in tgt_data['parts']]
+        
+        is_seq_match = True
+        
+        with col_res2:
+            st.markdown("### 🔗 연결 순서 검증")
             if not bom_match:
-                 st.warning("⚠️ 부품 개수가 달라서 순서를 1:1로 비교할 수 없습니다. 개수를 먼저 맞춰주세요.")
+                st.warning("⚠️ 부품 개수가 달라서 정확한 순서 비교가 어렵습니다.")
+                st.caption(f"회로도: {' → '.join(ref_list)}")
+                st.caption(f"실물: {' → '.join(tgt_list)}")
             else:
-                is_seq_match = True
                 for i in range(len(ref_list)):
                     r_item = ref_list[i]
                     t_item = tgt_list[i]
                     if r_item == t_item:
-                        st.success(f"✅ {i+1}번 부품: [{r_item}] - 일치")
+                        st.info(f"**Step {i+1}:** {r_item.upper()} ✅ 정상 연결됨")
                     else:
-                        st.error(f"❌ {i+1}번 부품: 회로도는 [{r_item}]인데, 실물은 [{t_item}]입니다.")
+                        st.error(f"**Step {i+1}:** 불일치 감지! (회로도: {r_item} vs 실물: {t_item})")
                         is_seq_match = False
                 
                 if is_seq_match:
-                    st.success("🎉 완벽합니다! 부품의 종류, 개수, 순서가 모두 일치합니다.")
+                    st.success("완벽합니다! 회로 연결 순서가 정확해요. 🎉")
                     st.balloons()
 
-            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption=f"회로도 정렬 ({len(ref_list)}개)", use_column_width=True)
-            st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption=f"실물 정렬 ({len(tgt_list)}개)", use_column_width=True)
-            
-            del res_ref_img, res_tgt_img
-            gc.collect()
+        my_bar.empty() # 진행바 제거
+
+        # 3. 시각화 이미지
+        st.markdown("### 📷 AI 인식 화면")
+        img_col1, img_col2 = st.columns(2)
+        with img_col1:
+            st.image(cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB), caption="회로도 분석 (번호는 전류 흐름 순서)", use_column_width=True)
+        with img_col2:
+            st.image(cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB), caption="실물 분석 (번호는 배치 순서)", use_column_width=True)
+
+        # --------------------------------------------------------
+        # [히스토리 저장]
+        # --------------------------------------------------------
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        status_msg = "성공 ✅" if (bom_match and is_seq_match) else "실패 ❌"
+        
+        # 히스토리 요약 텍스트 생성
+        detail_txt = f"부품: {'일치' if bom_match else '불일치'} / 순서: {'일치' if is_seq_match else '불일치'}"
+        
+        # 세션에 추가
+        st.session_state['history'].append({
+            "time": timestamp,
+            "status": status_msg,
+            "detail": detail_txt
+        })
+        
+        # 메모리 정리
+        del res_ref_img, res_tgt_img
+        gc.collect()
