@@ -14,7 +14,7 @@ import os
 import base64
 
 # ==========================================
-# [설정] CircuitMate AI V73: The End (With Delete)
+# [설정] CircuitMate AI V74: Actionable Advice
 # ==========================================
 st.set_page_config(page_title="CircuitMate AI", layout="wide", page_icon="⚡")
 
@@ -22,10 +22,9 @@ REAL_MODEL_PATH = 'best(3).pt'
 MODEL_SYM_PATH = 'symbol.pt'
 
 # --------------------------------------------------------
-# [시스템] 데이터베이스 및 사용자 관리 함수
+# [시스템] 데이터베이스 및 사용자 관리
 # --------------------------------------------------------
 def init_db():
-    """사용자 정보를 저장할 SQLite DB 생성"""
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users
@@ -63,17 +62,12 @@ def login_user(username, password):
     conn.close()
     return data
 
-# --------------------------------------------------------
-# [시스템] 히스토리 저장/불러오기 (Pickle 사용)
-# --------------------------------------------------------
 def save_history_to_file(username, history_data):
-    """사용자별 히스토리를 파일로 저장"""
     filename = f"history_{username}.pkl"
     with open(filename, 'wb') as f:
         pickle.dump(history_data, f)
 
 def load_history_from_file(username):
-    """파일에서 히스토리 불러오기"""
     filename = f"history_{username}.pkl"
     if os.path.exists(filename):
         with open(filename, 'rb') as f:
@@ -81,7 +75,7 @@ def load_history_from_file(username):
     return []
 
 # ==========================================
-# [Core Logic] V69 기존 로직 (변경 없음)
+# [Core Logic] 기존 기능 유지
 # ==========================================
 def resize_image_smart(image, max_size=1024):
     h, w = image.shape[:2]
@@ -222,6 +216,43 @@ def analyze_real(img, model):
             cv2.putText(img, str(i+1), (cx-5, cy+5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
     return img, {'parts': sorted_parts}
 
+# ==========================================
+# [New Feature] 해결책 제안 (Actionable Advice)
+# ==========================================
+def generate_fix_guide(ref_list, tgt_list):
+    """
+    순서가 다를 때, 어떤 부품을 어디로 옮겨야 하는지 가이드를 생성합니다.
+    """
+    guides = []
+    # 간단한 로직: 회로도(정답) 순서대로 실물을 맞추도록 안내
+    # 단, 부품 개수가 일치할 때만 작동
+    
+    if len(ref_list) == len(tgt_list):
+        for i in range(len(ref_list)):
+            expected = ref_list[i]
+            actual = tgt_list[i]
+            
+            if expected != actual:
+                # 1. 현재 자리에 있는 잘못된 부품
+                # 2. 올바른 부품이 실물 리스트의 어디에 있는지 찾음
+                found_at = -1
+                for j in range(len(tgt_list)):
+                    if tgt_list[j] == expected and j != i:
+                        found_at = j
+                        break
+                
+                if found_at != -1:
+                    msg = f"🔧 **[수정 가이드] Step {i+1}:** 현재 **{actual.upper()}**가 있습니다. 이를 **{found_at+1}번 위치**에 있는 **{expected.upper()}**와 자리를 바꿔주세요."
+                    guides.append(msg)
+                else:
+                    msg = f"🔧 **[수정 가이드] Step {i+1}:** 이곳에는 **{expected.upper()}**가 와야 합니다."
+                    guides.append(msg)
+                    
+    return list(set(guides)) # 중복 제거 후 반환
+
+# ==========================================
+# [Renderer]
+# ==========================================
 def render_result(result_data):
     st.divider()
     st.markdown("## 📊 분석 결과 리포트")
@@ -242,31 +273,40 @@ def render_result(result_data):
             st.caption(f"회로도: {' → '.join(ref_list)}")
             st.caption(f"실물: {' → '.join(tgt_list)}")
         else:
+            # 순서 비교 및 가이드 출력
             for i in range(len(ref_list)):
                 r_item = ref_list[i]
                 t_item = tgt_list[i]
                 if r_item == t_item:
                     st.info(f"**Step {i+1}:** {r_item.upper()} ✅ 정상 연결됨")
                 else:
-                    st.error(f"**Step {i+1}:** 불일치 감지! (회로도: {r_item} vs 실물: {t_item})")
+                    st.error(f"**Step {i+1}:** 불일치 (회로도: {r_item} vs 실물: {t_item})")
+            
+            # [NEW] 해결책 제안 (순서가 틀렸을 때만)
+            if not is_seq_match:
+                guides = generate_fix_guide(ref_list, tgt_list)
+                if guides:
+                    st.markdown("---")
+                    st.markdown("### 🛠️ 트러블슈팅 가이드 (AI Advice)")
+                    for guide in guides:
+                        st.warning(guide)
+
             if is_seq_match:
                 st.success("완벽합니다! 회로 연결 순서가 정확해요. 🎉")
                 st.balloons()
+
     st.markdown("### 📷 AI 인식 화면")
     img_col1, img_col2 = st.columns(2)
     with img_col1:
         st.image(result_data['res_ref_img'], caption="회로도 분석 (번호는 전류 흐름 순서)", use_column_width=True)
     with img_col2:
-        st.image(result_data['res_tgt_img'], caption="실물 분석", use_column_width=True)
+        st.image(result_data['res_tgt_img'], caption="실물 분석 (번호는 배치 순서)", use_column_width=True)
 
 # ==========================================
-# [Main Flow] 로그인 -> 메인 앱
+# [Main Flow]
 # ==========================================
-
-# DB 초기화
 init_db()
 
-# 세션 관리
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
 if 'username' not in st.session_state:
@@ -276,15 +316,10 @@ if 'active_result' not in st.session_state:
 if 'history' not in st.session_state:
     st.session_state['history'] = []
 
-# ------------------------------------------------
-# 1. 로그인 화면 (Logged In == False)
-# ------------------------------------------------
 if not st.session_state['logged_in']:
     st.title("⚡ CircuitMate AI")
     st.markdown("### 로그인하여 나만의 회로 검증 기록을 관리하세요.")
-    
     tab1, tab2 = st.tabs(["로그인", "회원가입"])
-    
     with tab1:
         username = st.text_input("아이디 (User Name)")
         password = st.text_input("비밀번호 (Password)", type='password')
@@ -293,28 +328,20 @@ if not st.session_state['logged_in']:
             if result:
                 st.session_state['logged_in'] = True
                 st.session_state['username'] = username
-                # 로그인 성공 시 파일에서 히스토리 복원
                 st.session_state['history'] = load_history_from_file(username)
                 st.success(f"{username}님 환영합니다!")
                 st.rerun()
             else:
                 st.error("아이디 또는 비밀번호가 틀렸습니다.")
-
     with tab2:
         new_user = st.text_input("새 아이디")
         new_password = st.text_input("새 비밀번호", type='password')
         if st.button("회원가입"):
             if add_user(new_user, new_password):
                 st.success("계정이 생성되었습니다! 로그인 탭에서 로그인해주세요.")
-                st.info("비밀번호는 안전하게 암호화되어 저장됩니다.")
             else:
                 st.error("이미 존재하는 아이디입니다.")
-
-# ------------------------------------------------
-# 2. 메인 앱 화면 (Logged In == True)
-# ------------------------------------------------
 else:
-    # [사이드바]
     with st.sidebar:
         st.title(f"👤 {st.session_state['username']}님")
         if st.button("로그아웃"):
@@ -323,10 +350,7 @@ else:
             st.session_state['history'] = []
             st.session_state['active_result'] = None
             st.rerun()
-            
         st.divider()
-        st.caption("CircuitMate AI System")
-        
         try:
             if 'models_loaded' not in st.session_state:
                 gc.collect()
@@ -335,45 +359,27 @@ else:
                 st.session_state['models_loaded'] = True
             st.success("✅ 시스템 준비 완료")
         except: st.stop()
-
         st.divider()
         st.markdown("### 🕒 최근 검증 기록")
-        
-        # [NEW] 삭제 기능이 포함된 히스토리 버튼 Loop
         if not st.session_state['history']:
             st.caption("기록이 없습니다.")
         else:
-            # 최신순(역순)으로 순회하되, 실제 삭제를 위해 인덱스는 뒤에서부터 접근
-            # Range: len-1 부터 0 까지 -1씩 감소 (최신 -> 과거)
             for i in range(len(st.session_state['history']) - 1, -1, -1):
                 item = st.session_state['history'][i]
-                
-                # 버튼을 두 개로 나눔 (보기 / 삭제)
                 col_view, col_del = st.columns([4, 1])
-                
                 with col_view:
-                    btn_label = f"{item['time']} - {item['status']}"
-                    # 고유 키(key)를 줘서 충돌 방지
-                    if st.button(btn_label, key=f"view_{i}", use_container_width=True):
+                    if st.button(f"{item['time']} - {item['status']}", key=f"view_{i}", use_container_width=True):
                         st.session_state['active_result'] = item
-                
                 with col_del:
-                    # 삭제 버튼 (휴지통 아이콘)
                     if st.button("🗑️", key=f"del_{i}"):
-                        # 1. 리스트에서 제거
                         deleted_item = st.session_state['history'].pop(i)
-                        # 2. 파일에 저장 (영구 삭제 반영)
                         save_history_to_file(st.session_state['username'], st.session_state['history'])
-                        # 3. 만약 현재 보고 있던 결과라면 화면 비우기
                         if st.session_state['active_result'] == deleted_item:
                             st.session_state['active_result'] = None
-                        # 4. 새로고침
                         st.rerun()
 
-    # [메인 콘텐츠]
     st.title("⚡ CircuitMate AI")
     st.markdown(f"**{st.session_state['username']}**님의 회로 검증 공간입니다.")
-
     col1, col2 = st.columns(2)
     with col1:
         ref_file = st.file_uploader("1️⃣ 회로도 (Schematic)", type=['jpg', 'png', 'jpeg'])
@@ -390,18 +396,15 @@ else:
             gc.collect()
             progress_text = "AI가 회로를 분석 중입니다..."
             my_bar = st.progress(0, text=progress_text)
-
             res_ref_img, ref_data = analyze_schematic(ref_cv.copy(), st.session_state['model_sym'])
             my_bar.progress(50, text="실물 보드 인식 중...")
             res_tgt_img, tgt_data = analyze_real(tgt_cv.copy(), st.session_state['model_real'])
             my_bar.progress(90, text="결과 정리 중...")
-
-            # 데이터 가공
+            
             ref_counts = defaultdict(int)
             tgt_counts = defaultdict(int)
             for p in ref_data['parts']: ref_counts[p['name']] += 1
             for p in tgt_data['parts']: tgt_counts[p['name']] += 1
-            
             all_keys = set(ref_counts.keys()) | set(tgt_counts.keys())
             bom_match = True
             bom_data = []
@@ -411,7 +414,6 @@ else:
                 status = "✅ 일치" if r == t else "⚠️ 확인 필요"
                 bom_data.append({"부품명": k.upper(), "회로도 개수": r, "실물 개수": t, "상태": status})
                 if r != t: bom_match = False
-            
             ref_list = [p['name'] for p in ref_data['parts']]
             tgt_list = [p['name'] for p in tgt_data['parts']]
             is_seq_match = True
@@ -419,31 +421,21 @@ else:
             else:
                 for i in range(len(ref_list)):
                     if ref_list[i] != tgt_list[i]: is_seq_match = False
-
-            # 결과 패킷 생성
+            
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
             status_msg = "성공 ✅" if (bom_match and is_seq_match) else "실패 ❌"
-            
             result_packet = {
-                "time": timestamp,
-                "status": status_msg,
-                "bom_match": bom_match,
-                "is_seq_match": is_seq_match,
-                "bom_data": bom_data,
-                "ref_list": ref_list,
-                "tgt_list": tgt_list,
+                "time": timestamp, "status": status_msg, "bom_match": bom_match,
+                "is_seq_match": is_seq_match, "bom_data": bom_data,
+                "ref_list": ref_list, "tgt_list": tgt_list,
                 "res_ref_img": cv2.cvtColor(res_ref_img, cv2.COLOR_BGR2RGB),
                 "res_tgt_img": cv2.cvtColor(res_tgt_img, cv2.COLOR_BGR2RGB)
             }
-
-            # 세션 및 파일 저장
             st.session_state['history'].append(result_packet)
             st.session_state['active_result'] = result_packet
             save_history_to_file(st.session_state['username'], st.session_state['history'])
-            
             my_bar.empty()
             gc.collect()
 
-    # 결과 렌더링
     if st.session_state['active_result']:
         render_result(st.session_state['active_result'])
